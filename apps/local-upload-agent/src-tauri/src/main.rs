@@ -932,6 +932,10 @@ fn read_gcloud_child_output<R: Read + Send + 'static>(
 
 fn build_gcloud_env_vars() -> Vec<(String, String)> {
     let mut vars = Vec::new();
+    vars.push((
+        "CLOUDSDK_ACCESSIBILITY_SCREEN_READER".to_string(),
+        "True".to_string(),
+    ));
     let disable_parallel_composite_upload = env::var("LOCAL_UPLOAD_AGENT_GCLOUD_PARALLEL_COMPOSITE_UPLOAD")
         .ok()
         .map(|value| value.trim().eq_ignore_ascii_case("false"))
@@ -2077,7 +2081,7 @@ fn run_gcloud_import_task(
         );
 
         let mut command =
-            build_gcloud_command(&gcloud_spec, &["storage", "cp", "--quiet", &task.local_file_path, &gs_uri]);
+            build_gcloud_command(&gcloud_spec, &["storage", "cp", &task.local_file_path, &gs_uri]);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.envs(build_gcloud_command_envs(auth_context_for_cleanup.as_ref()));
