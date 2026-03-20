@@ -109,6 +109,10 @@ jobs:
             tauri_args+=(--no-sign)
           fi
 
+          if [[ "${{ runner.os }}" == "macOS" && "${CHUANGCUT_AGENT_UNSIGNED_RELEASE}" == "true" ]]; then
+            tauri_args+=(--bundles app)
+          fi
+
           pnpm --dir apps/local-upload-agent exec tauri "${tauri_args[@]}"
 
       - name: Create portable archive (macOS)
@@ -116,22 +120,31 @@ jobs:
         shell: bash
         run: |
           shopt -s nullglob
-          DMG_PATH="$(find apps/local-upload-agent/src-tauri/target -path '*/bundle/dmg/*.dmg' -print | head -n 1)"
-          if [[ -z "${DMG_PATH}" ]]; then
-            find apps/local-upload-agent/src-tauri/target -maxdepth 6 -type d -print || true
-            echo "未找到 macOS dmg"
-            exit 1
-          fi
-
           mkdir -p portable-assets
-          MOUNT_POINT="$(mktemp -d /tmp/chuangcut-agent-dmg.XXXXXX)"
-          trap 'hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true; rmdir "${MOUNT_POINT}" >/dev/null 2>&1 || true' EXIT
-          hdiutil attach "${DMG_PATH}" -nobrowse -readonly -mountpoint "${MOUNT_POINT}" >/dev/null
+          if [[ "${CHUANGCUT_AGENT_UNSIGNED_RELEASE}" == "true" ]]; then
+            APP_BUNDLE="$(find apps/local-upload-agent/src-tauri/target -path '*/bundle/macos/*.app' -print | head -n 1)"
+            if [[ -z "${APP_BUNDLE}" ]]; then
+              find apps/local-upload-agent/src-tauri/target -maxdepth 8 -print || true
+              echo "未找到 macOS app bundle"
+              exit 1
+            fi
+          else
+            DMG_PATH="$(find apps/local-upload-agent/src-tauri/target -path '*/bundle/dmg/*.dmg' -print | head -n 1)"
+            if [[ -z "${DMG_PATH}" ]]; then
+              find apps/local-upload-agent/src-tauri/target -maxdepth 8 -print || true
+              echo "未找到 macOS dmg"
+              exit 1
+            fi
 
-          APP_BUNDLE="$(find "${MOUNT_POINT}" -maxdepth 2 -type d -name '*.app' | head -n 1)"
-          if [[ -z "${APP_BUNDLE}" ]]; then
-            echo "dmg 内未找到 macOS app bundle"
-            exit 1
+            MOUNT_POINT="$(mktemp -d /tmp/chuangcut-agent-dmg.XXXXXX)"
+            trap 'hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true; rmdir "${MOUNT_POINT}" >/dev/null 2>&1 || true' EXIT
+            hdiutil attach "${DMG_PATH}" -nobrowse -readonly -mountpoint "${MOUNT_POINT}" >/dev/null
+
+            APP_BUNDLE="$(find "${MOUNT_POINT}" -maxdepth 2 -type d -name '*.app' | head -n 1)"
+            if [[ -z "${APP_BUNDLE}" ]]; then
+              echo "dmg 内未找到 macOS app bundle"
+              exit 1
+            fi
           fi
 
           ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" portable-assets/ChuangCutLocalUploadAgent-macos-portable.zip
@@ -153,9 +166,9 @@ jobs:
           }
 
           if [[ "${{ runner.os }}" == "macOS" ]]; then
-            add_first_match '*/bundle/dmg/*.dmg'
             files+=(portable-assets/ChuangCutLocalUploadAgent-macos-portable.zip)
             if [[ "${CHUANGCUT_AGENT_UNSIGNED_RELEASE}" != "true" ]]; then
+              add_first_match '*/bundle/dmg/*.dmg'
               add_first_match '*/bundle/macos/*.app.tar.gz'
               add_first_match '*/bundle/macos/*.app.tar.gz.sig'
             fi
