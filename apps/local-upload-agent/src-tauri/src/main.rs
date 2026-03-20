@@ -34,6 +34,13 @@ const DEFAULT_PARALLEL_UPLOADS: usize = 4;
 const UPDATE_ENDPOINT: Option<&str> = option_env!("CHUANGCUT_AGENT_UPDATER_ENDPOINT");
 const UPDATE_PUBKEY: Option<&str> = option_env!("CHUANGCUT_AGENT_UPDATER_PUBKEY");
 
+#[derive(Clone)]
+struct GcloudCommandSpec {
+    program: String,
+    prefix_args: Vec<String>,
+    display_path: String,
+}
+
 fn append_startup_log(message: impl AsRef<str>) {
     let path = startup_log_path();
     let timestamp = SystemTime::now()
@@ -690,15 +697,121 @@ fn build_gcloud_env_vars() -> Vec<(String, String)> {
     vars
 }
 
-fn ensure_gcloud_installed() -> Result<(), String> {
-    let status = Command::new("gcloud")
-        .arg("version")
+fn build_gcloud_command(spec: &GcloudCommandSpec, args: &[&str]) -> Command {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.prefix_args);
+    command.args(args);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn windows_gcloud_install_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for env_name in ["LOCALAPPDATA", "ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(base) = env::var_os(env_name) {
+            let base = PathBuf::from(base);
+            candidates.push(
+                base.join("Google")
+                    .join("Cloud SDK")
+                    .join("google-cloud-sdk")
+                    .join("bin")
+                    .join("gcloud.cmd"),
+            );
+            candidates.push(
+                base.join("Google")
+                    .join("Cloud SDK")
+                    .join("google-cloud-sdk")
+                    .join("bin")
+                    .join("gcloud.exe"),
+            );
+        }
+    }
+
+    candidates
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_gcloud_command() -> Result<GcloudCommandSpec, String> {
+    for candidate in ["gcloud.cmd", "gcloud.exe", "gcloud"] {
+        let output = Command::new("where.exe").arg(candidate).output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                if let Some(line) = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                {
+                    let resolved = PathBuf::from(line);
+                    let resolved_string = resolved.to_string_lossy().to_string();
+                    let extension = resolved
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(|value| value.to_ascii_lowercase());
+
+                    if matches!(extension.as_deref(), Some("cmd") | Some("bat")) {
+                        return Ok(GcloudCommandSpec {
+                            program: "cmd.exe".to_string(),
+                            prefix_args: vec!["/C".to_string(), resolved_string.clone()],
+                            display_path: resolved_string,
+                        });
+                    }
+
+                    return Ok(GcloudCommandSpec {
+                        program: resolved_string.clone(),
+                        prefix_args: Vec::new(),
+                        display_path: resolved_string,
+                    });
+                }
+            }
+        }
+    }
+
+    for path in windows_gcloud_install_candidates() {
+        if path.is_file() {
+            let resolved_string = path.to_string_lossy().to_string();
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase());
+
+            if matches!(extension.as_deref(), Some("cmd") | Some("bat")) {
+                return Ok(GcloudCommandSpec {
+                    program: "cmd.exe".to_string(),
+                    prefix_args: vec!["/C".to_string(), resolved_string.clone()],
+                    display_path: resolved_string,
+                });
+            }
+
+            return Ok(GcloudCommandSpec {
+                program: resolved_string.clone(),
+                prefix_args: Vec::new(),
+                display_path: resolved_string,
+            });
+        }
+    }
+
+    Err("未检测到 gcloud CLI，请先安装并完成 gcloud auth login".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_gcloud_command() -> Result<GcloudCommandSpec, String> {
+    Ok(GcloudCommandSpec {
+        program: "gcloud".to_string(),
+        prefix_args: Vec::new(),
+        display_path: "gcloud".to_string(),
+    })
+}
+
+fn ensure_gcloud_installed() -> Result<GcloudCommandSpec, String> {
+    let spec = resolve_gcloud_command()?;
+    let status = build_gcloud_command(&spec, &["version"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
 
     match status {
-        Ok(result) if result.success() => Ok(()),
+        Ok(result) if result.success() => Ok(spec),
         Ok(_) => Err("gcloud CLI 不可用，请检查本机安装和登录状态".to_string()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Err("未检测到 gcloud CLI，请先安装并完成 gcloud auth login".to_string())
@@ -708,10 +821,16 @@ fn ensure_gcloud_installed() -> Result<(), String> {
 }
 
 fn run_gcloud_command(task: &TaskHandle, args: &[&str]) -> Result<(), String> {
-    ensure_gcloud_installed()?;
+    let spec = ensure_gcloud_installed()?;
+    append_log(
+        task,
+        "debug",
+        format!("已解析 gcloud CLI 路径：{}", spec.display_path),
+        None,
+        None,
+    );
 
-    let mut command = Command::new("gcloud");
-    command.args(args);
+    let mut command = build_gcloud_command(&spec, args);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.envs(build_gcloud_env_vars());
@@ -1550,11 +1669,17 @@ fn run_gcloud_import_task(
             snapshot.object_name = Some(object_name.clone());
         });
 
-        ensure_gcloud_installed()?;
-        append_log(&handle, "debug", "已检测到 gcloud CLI，开始上传到 GCS", None, Some(gs_uri.clone()));
+        let gcloud_spec = ensure_gcloud_installed()?;
+        append_log(
+            &handle,
+            "debug",
+            format!("已检测到 gcloud CLI：{}，开始上传到 GCS", gcloud_spec.display_path),
+            None,
+            Some(gs_uri.clone()),
+        );
 
-        let mut command = Command::new("gcloud");
-        command.args(["storage", "cp", "--quiet", &task.local_file_path, &gs_uri]);
+        let mut command =
+            build_gcloud_command(&gcloud_spec, &["storage", "cp", "--quiet", &task.local_file_path, &gs_uri]);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.envs(build_gcloud_env_vars());
