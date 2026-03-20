@@ -2335,16 +2335,21 @@ fn main() {
     install_startup_panic_hook();
     append_startup_log("startup panic hook installed");
 
-    let updater_plugin = if let Some(pubkey) = UPDATE_PUBKEY.filter(|value| !value.trim().is_empty()) {
-        tauri_plugin_updater::Builder::new().pubkey(pubkey.to_string())
-    } else {
-        tauri_plugin_updater::Builder::new()
-    };
-
     append_startup_log("即将进入 tauri 启动流程");
+    let mut builder = tauri::Builder::default();
+    if updater_configured() {
+        append_startup_log("检测到有效的 updater 配置，注册 updater 插件");
+        let updater_plugin = if let Some(pubkey) = UPDATE_PUBKEY.filter(|value| !value.trim().is_empty()) {
+            tauri_plugin_updater::Builder::new().pubkey(pubkey.to_string())
+        } else {
+            tauri_plugin_updater::Builder::new()
+        };
+        builder = builder.plugin(updater_plugin.build());
+    } else {
+        append_startup_log("未检测到有效的 updater 配置，跳过 updater 插件注册");
+    }
 
-    let run_result = tauri::Builder::default()
-        .plugin(updater_plugin.build())
+    let run_result = builder
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;

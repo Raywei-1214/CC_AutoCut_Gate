@@ -12,9 +12,10 @@ const windowsTimestampUrl = process.env.WINDOWS_TIMESTAMP_URL?.trim() ?? ''
 
 const raw = await fs.readFile(tauriConfigPath, 'utf8')
 const config = JSON.parse(raw)
+const updaterConfigured = Boolean(updaterEndpoint && updaterPubkey)
 
 config.bundle ??= {}
-config.bundle.createUpdaterArtifacts = true
+config.bundle.createUpdaterArtifacts = updaterConfigured
 config.bundle.windows ??= {}
 
 if (windowsThumbprint && windowsTimestampUrl) {
@@ -24,12 +25,20 @@ if (windowsThumbprint && windowsTimestampUrl) {
 }
 
 config.plugins ??= {}
-config.plugins.updater = {
-  pubkey: updaterPubkey,
-  endpoints: updaterEndpoint ? [updaterEndpoint] : [],
-  windows: {
-    installMode: 'passive',
-  },
+
+if (updaterConfigured) {
+  config.plugins.updater = {
+    pubkey: updaterPubkey,
+    endpoints: [updaterEndpoint],
+    windows: {
+      installMode: 'passive',
+    },
+  }
+} else {
+  delete config.plugins.updater
+  if (Object.keys(config.plugins).length === 0) {
+    delete config.plugins
+  }
 }
 
 await fs.writeFile(tauriConfigPath, `${JSON.stringify(config, null, 2)}\n`)
