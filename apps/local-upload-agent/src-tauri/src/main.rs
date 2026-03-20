@@ -41,6 +41,15 @@ struct GcloudCommandSpec {
     display_path: String,
 }
 
+#[derive(Clone)]
+struct GcloudAuthContext {
+    temp_dir: PathBuf,
+    config_dir: PathBuf,
+    key_file_path: PathBuf,
+    project_id: Option<String>,
+    client_email: Option<String>,
+}
+
 fn append_startup_log(message: impl AsRef<str>) {
     let path = startup_log_path();
     let timestamp = SystemTime::now()
@@ -186,6 +195,7 @@ struct AgentUploadTask {
     api_token: String,
     bucket_name: Option<String>,
     object_prefix: Option<String>,
+    service_account_json: Option<String>,
 }
 
 struct UpdaterRuntimeState {
@@ -245,6 +255,8 @@ struct CreateGcloudImportBody {
     bucket_name: String,
     #[serde(rename = "objectPrefix")]
     object_prefix: String,
+    #[serde(rename = "serviceAccountJson")]
+    service_account_json: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -697,6 +709,76 @@ fn build_gcloud_env_vars() -> Vec<(String, String)> {
     vars
 }
 
+fn build_gcloud_command_envs(auth_context: Option<&GcloudAuthContext>) -> Vec<(String, String)> {
+    let mut vars = build_gcloud_env_vars();
+
+    if let Some(auth_context) = auth_context {
+        vars.push((
+            "CLOUDSDK_CONFIG".to_string(),
+            auth_context.config_dir.to_string_lossy().to_string(),
+        ));
+        vars.push((
+            "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+            auth_context.key_file_path.to_string_lossy().to_string(),
+        ));
+        vars.push((
+            "CLOUDSDK_CORE_DISABLE_PROMPTS".to_string(),
+            "1".to_string(),
+        ));
+    }
+
+    vars
+}
+
+fn create_gcloud_auth_context(service_account_json: &str) -> Result<GcloudAuthContext, String> {
+    let parsed =
+        serde_json::from_str::<Value>(service_account_json).map_err(|error| format!("解析 Service Account JSON 失败：{error}"))?;
+    let project_id = parsed
+        .get("project_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let client_email = parsed
+        .get("client_email")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let temp_dir = env::temp_dir().join(format!(
+        "chuangcut-local-upload-agent-gcloud-{}",
+        Uuid::new_v4()
+    ));
+    let config_dir = temp_dir.join("config");
+    let key_file_path = temp_dir.join("service-account.json");
+
+    fs::create_dir_all(&config_dir).map_err(|error| format!("创建临时 GCloud 配置目录失败：{error}"))?;
+    fs::write(&key_file_path, service_account_json)
+        .map_err(|error| format!("写入临时 Service Account JSON 失败：{error}"))?;
+
+    Ok(GcloudAuthContext {
+        temp_dir,
+        config_dir,
+        key_file_path,
+        project_id,
+        client_email,
+    })
+}
+
+fn cleanup_gcloud_auth_context(handle: &TaskHandle, auth_context: GcloudAuthContext) {
+    match fs::remove_dir_all(&auth_context.temp_dir) {
+        Ok(()) => append_log(handle, "debug", "已清理临时 GCloud 凭据目录", None, None),
+        Err(error) => append_log(
+            handle,
+            "warn",
+            "清理临时 GCloud 凭据目录失败",
+            None,
+            Some(error.to_string()),
+        ),
+    }
+}
+
 fn build_gcloud_command(spec: &GcloudCommandSpec, args: &[&str]) -> Command {
     let mut command = Command::new(&spec.program);
     command.args(&spec.prefix_args);
@@ -820,20 +902,16 @@ fn ensure_gcloud_installed() -> Result<GcloudCommandSpec, String> {
     }
 }
 
-fn run_gcloud_command(task: &TaskHandle, args: &[&str]) -> Result<(), String> {
-    let spec = ensure_gcloud_installed()?;
-    append_log(
-        task,
-        "debug",
-        format!("已解析 gcloud CLI 路径：{}", spec.display_path),
-        None,
-        None,
-    );
-
+fn run_gcloud_command_with_spec(
+    task: &TaskHandle,
+    spec: &GcloudCommandSpec,
+    auth_context: Option<&GcloudAuthContext>,
+    args: &[&str],
+) -> Result<(), String> {
     let mut command = build_gcloud_command(&spec, args);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    command.envs(build_gcloud_env_vars());
+    command.envs(build_gcloud_command_envs(auth_context));
 
     let mut child = command
         .spawn()
@@ -871,6 +949,62 @@ fn run_gcloud_command(task: &TaskHandle, args: &[&str]) -> Result<(), String> {
         .unwrap_or_else(|| format!("gcloud 命令执行失败，退出码 {}", status.code().unwrap_or(1)));
 
     Err(last_output)
+}
+
+fn run_gcloud_command(
+    task: &TaskHandle,
+    args: &[&str],
+    auth_context: Option<&GcloudAuthContext>,
+) -> Result<(), String> {
+    let spec = ensure_gcloud_installed()?;
+    append_log(
+        task,
+        "debug",
+        format!("已解析 gcloud CLI 路径：{}", spec.display_path),
+        None,
+        None,
+    );
+
+    run_gcloud_command_with_spec(task, &spec, auth_context, args)
+}
+
+fn activate_gcloud_service_account(
+    task: &TaskHandle,
+    spec: &GcloudCommandSpec,
+    auth_context: &GcloudAuthContext,
+) -> Result<(), String> {
+    let key_file_path = auth_context.key_file_path.to_string_lossy().to_string();
+    append_log(
+        task,
+        "debug",
+        format!(
+            "准备使用项目 GCS Service Account：{}",
+            auth_context
+                .client_email
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        None,
+        Some(key_file_path.clone()),
+    );
+
+    run_gcloud_command_with_spec(
+        task,
+        spec,
+        Some(auth_context),
+        &["auth", "activate-service-account", "--key-file", &key_file_path, "--quiet"],
+    )?;
+
+    if let Some(project_id) = auth_context.project_id.as_deref() {
+        run_gcloud_command_with_spec(
+            task,
+            spec,
+            Some(auth_context),
+            &["config", "set", "project", project_id, "--quiet"],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn build_auth(request: reqwest::blocking::RequestBuilder, api_token: &str) -> reqwest::blocking::RequestBuilder {
@@ -1642,6 +1776,7 @@ fn run_gcloud_import_task(
     tasks: Arc<Mutex<HashMap<String, TaskHandle>>>,
 ) {
     let started_at_system = SystemTime::now();
+    let mut auth_context_for_cleanup: Option<GcloudAuthContext> = None;
 
     let result = (|| -> Result<UploadTaskResult, String> {
         let bucket_name = task
@@ -1670,6 +1805,24 @@ fn run_gcloud_import_task(
         });
 
         let gcloud_spec = ensure_gcloud_installed()?;
+        if let Some(service_account_json) = task
+            .service_account_json
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let auth_context = create_gcloud_auth_context(service_account_json)?;
+            activate_gcloud_service_account(&handle, &gcloud_spec, &auth_context)?;
+            auth_context_for_cleanup = Some(auth_context);
+        } else {
+            append_log(
+                &handle,
+                "debug",
+                "未提供项目 GCS Service Account，回退到本机 gcloud 登录态",
+                None,
+                None,
+            );
+        }
+
         append_log(
             &handle,
             "debug",
@@ -1682,7 +1835,7 @@ fn run_gcloud_import_task(
             build_gcloud_command(&gcloud_spec, &["storage", "cp", "--quiet", &task.local_file_path, &gs_uri]);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
-        command.envs(build_gcloud_env_vars());
+        command.envs(build_gcloud_command_envs(auth_context_for_cleanup.as_ref()));
 
         let mut child = command.spawn().map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => {
@@ -1771,7 +1924,11 @@ fn run_gcloud_import_task(
             snapshot.speed_bytes_per_second = 0.0;
         });
 
-        run_gcloud_command(&handle, &["storage", "objects", "describe", &gs_uri, "--format=json"])?;
+        run_gcloud_command(
+            &handle,
+            &["storage", "objects", "describe", &gs_uri, "--format=json"],
+            auth_context_for_cleanup.as_ref(),
+        )?;
 
         append_log(&handle, "debug", "GCS 对象已上传完成，开始导入站内素材", None, Some(gs_uri.clone()));
         update_snapshot(&handle, |snapshot| {
@@ -1797,6 +1954,10 @@ fn run_gcloud_import_task(
             asset_id: Some(imported.data.asset_id),
         })
     })();
+
+    if let Some(auth_context) = auth_context_for_cleanup.take() {
+        cleanup_gcloud_auth_context(&handle, auth_context);
+    }
 
     match result {
         Ok(task_result) => {
@@ -1984,6 +2145,7 @@ fn handle_create_upload(mut request: Request, state: &AgentHttpState) {
         api_token: body.api_token.trim().to_string(),
         bucket_name: None,
         object_prefix: None,
+        service_account_json: None,
     };
 
     let background_handle = handle.clone();
@@ -2097,6 +2259,10 @@ fn handle_create_gcloud_import(mut request: Request, state: &AgentHttpState) {
         api_token: body.api_token.trim().to_string(),
         bucket_name: Some(body.bucket_name.trim().to_string()),
         object_prefix: Some(body.object_prefix.trim().to_string()),
+        service_account_json: body
+            .service_account_json
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     };
 
     let background_handle = handle.clone();
