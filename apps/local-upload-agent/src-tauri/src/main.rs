@@ -1,4 +1,5 @@
 use mime_guess::MimeGuess;
+use regex::Regex;
 use reqwest::blocking::Client;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,15 @@ struct GcloudAuthContext {
     key_file_path: PathBuf,
     project_id: Option<String>,
     client_email: Option<String>,
+}
+
+#[derive(Default)]
+struct GcloudProgressState {
+    uploaded_bytes: u64,
+    total_bytes: u64,
+    progress_percent: f64,
+    speed_bytes_per_second: f64,
+    last_sampled_at: Option<Instant>,
 }
 
 fn append_startup_log(message: impl AsRef<str>) {
@@ -670,6 +680,176 @@ fn append_output_tail(output_tail: &Arc<Mutex<Vec<String>>>, line: &str) {
     }
 }
 
+fn strip_ansi_codes(input: &str) -> String {
+    let mut stripped = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                let _ = chars.next();
+                while let Some(next_ch) = chars.next() {
+                    if ('@'..='~').contains(&next_ch) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        stripped.push(ch);
+    }
+
+    stripped
+}
+
+fn parse_gcloud_size_to_bytes(value: &str, unit: &str) -> Option<u64> {
+    let magnitude = value.trim().parse::<f64>().ok()?;
+    let factor = match unit.trim().to_ascii_uppercase().as_str() {
+        "B" => 1.0,
+        "KB" => 1024.0,
+        "KIB" => 1024.0,
+        "MB" => 1024.0 * 1024.0,
+        "MIB" => 1024.0 * 1024.0,
+        "GB" => 1024.0 * 1024.0 * 1024.0,
+        "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "TB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+
+    Some((magnitude * factor).round().max(0.0) as u64)
+}
+
+fn parse_gcloud_percent(line: &str) -> Option<f64> {
+    static PERCENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let regex = PERCENT_RE.get_or_init(|| Regex::new(r"(?i)(\d{1,3}(?:\.\d+)?)\s*%").expect("valid percent regex"));
+    regex
+        .captures(line)
+        .and_then(|captures| captures.get(1))
+        .and_then(|value| value.as_str().parse::<f64>().ok())
+        .map(|value| value.clamp(0.0, 100.0))
+}
+
+fn parse_gcloud_byte_fraction(line: &str) -> Option<(u64, u64)> {
+    static FRACTION_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let regex = FRACTION_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(\d+(?:\.\d+)?)\s*([KMGT]?i?B)\s*/\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)",
+        )
+        .expect("valid gcloud byte fraction regex")
+    });
+
+    let captures = regex.captures(line)?;
+    let uploaded_bytes = parse_gcloud_size_to_bytes(captures.get(1)?.as_str(), captures.get(2)?.as_str())?;
+    let total_bytes = parse_gcloud_size_to_bytes(captures.get(3)?.as_str(), captures.get(4)?.as_str())?;
+    Some((uploaded_bytes.min(total_bytes), total_bytes))
+}
+
+fn parse_gcloud_speed(line: &str) -> Option<f64> {
+    static SPEED_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let regex = SPEED_RE.get_or_init(|| {
+        Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*([KMGT]?i?B)\s*/\s*s").expect("valid gcloud speed regex")
+    });
+
+    let captures = regex.captures(line)?;
+    parse_gcloud_size_to_bytes(captures.get(1)?.as_str(), captures.get(2)?.as_str()).map(|value| value as f64)
+}
+
+fn parse_gcloud_progress_line(line: &str, file_size: u64) -> Option<(u64, u64, f64, Option<f64>)> {
+    let normalized = strip_ansi_codes(line);
+    let normalized = normalized.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let fraction = parse_gcloud_byte_fraction(normalized);
+    let percent = parse_gcloud_percent(normalized);
+    let speed = parse_gcloud_speed(normalized);
+
+    if fraction.is_none() && percent.is_none() && speed.is_none() {
+        return None;
+    }
+
+    let (uploaded_bytes, total_bytes) = if let Some((uploaded_bytes, total_bytes)) = fraction {
+        (uploaded_bytes.min(file_size), total_bytes.max(file_size))
+    } else if let Some(progress_percent) = percent {
+        let total_bytes = file_size;
+        let uploaded_bytes =
+            ((progress_percent / 100.0) * total_bytes as f64).round().clamp(0.0, total_bytes as f64) as u64;
+        (uploaded_bytes, total_bytes)
+    } else {
+        return None;
+    };
+
+    let progress_percent = percent.unwrap_or_else(|| {
+        if total_bytes == 0 {
+            0.0
+        } else {
+            (uploaded_bytes as f64 / total_bytes as f64) * 100.0
+        }
+    });
+
+    Some((uploaded_bytes, total_bytes, progress_percent.clamp(0.0, 100.0), speed))
+}
+
+fn update_gcloud_progress_state(
+    handle: &TaskHandle,
+    state: &Arc<Mutex<GcloudProgressState>>,
+    task: &AgentUploadTask,
+    uploaded_bytes: u64,
+    total_bytes: u64,
+    progress_percent: f64,
+    speed_hint: Option<f64>,
+) {
+    let sampled_at = Instant::now();
+    let mut next_uploaded_bytes = uploaded_bytes.min(task.file_size);
+    let mut next_total_bytes = total_bytes.max(task.file_size);
+    let mut next_progress_percent = progress_percent.clamp(0.0, 100.0);
+    let mut next_speed_bytes_per_second = speed_hint.unwrap_or(0.0);
+
+    if let Ok(mut progress_state) = state.lock() {
+        next_uploaded_bytes = next_uploaded_bytes.max(progress_state.uploaded_bytes);
+        next_total_bytes = next_total_bytes.max(progress_state.total_bytes.max(task.file_size));
+        next_progress_percent = next_progress_percent.max(progress_state.progress_percent);
+
+        if next_speed_bytes_per_second <= 0.0 {
+            if let Some(previous_sampled_at) = progress_state.last_sampled_at {
+                let elapsed_seconds = sampled_at
+                    .duration_since(previous_sampled_at)
+                    .as_secs_f64()
+                    .max(0.001);
+                let delta_bytes = next_uploaded_bytes.saturating_sub(progress_state.uploaded_bytes) as f64;
+                next_speed_bytes_per_second = delta_bytes / elapsed_seconds;
+            }
+        }
+
+        if next_speed_bytes_per_second > 0.0 && progress_state.speed_bytes_per_second > 0.0 {
+            next_speed_bytes_per_second =
+                progress_state.speed_bytes_per_second * 0.65 + next_speed_bytes_per_second * 0.35;
+        }
+
+        progress_state.uploaded_bytes = next_uploaded_bytes;
+        progress_state.total_bytes = next_total_bytes;
+        progress_state.progress_percent = next_progress_percent;
+        if next_speed_bytes_per_second > 0.0 {
+            progress_state.speed_bytes_per_second = next_speed_bytes_per_second;
+        }
+        progress_state.last_sampled_at = Some(sampled_at);
+        next_speed_bytes_per_second = progress_state.speed_bytes_per_second;
+    }
+
+    update_snapshot(handle, |snapshot| {
+        snapshot.status = AgentTaskStatus::Uploading;
+        snapshot.uploaded_bytes = next_uploaded_bytes;
+        snapshot.total_bytes = next_total_bytes;
+        snapshot.progress = next_progress_percent.clamp(5.0, 88.0);
+        if next_speed_bytes_per_second > 0.0 {
+            snapshot.speed_bytes_per_second = next_speed_bytes_per_second;
+        }
+    });
+}
+
 fn read_child_output<R: Read + Send + 'static>(
     reader: R,
     handle: TaskHandle,
@@ -681,6 +861,71 @@ fn read_child_output<R: Read + Send + 'static>(
         for line in buffered.lines().map_while(Result::ok) {
             append_output_tail(&output_tail, &line);
             append_log(&handle, level, line, None, None);
+        }
+    });
+}
+
+fn read_gcloud_child_output<R: Read + Send + 'static>(
+    reader: R,
+    handle: TaskHandle,
+    level: &'static str,
+    output_tail: Arc<Mutex<Vec<String>>>,
+    progress_state: Arc<Mutex<GcloudProgressState>>,
+    task: AgentUploadTask,
+) {
+    thread::spawn(move || {
+        let mut buffered = BufReader::new(reader);
+        let mut chunk = [0_u8; 4096];
+        let mut current = Vec::<u8>::new();
+
+        let flush_segment = |segment: &[u8]| {
+            let raw = String::from_utf8_lossy(segment);
+            let line = raw.trim_matches(|ch| ch == '\r' || ch == '\n').trim().to_string();
+            if line.is_empty() {
+                return;
+            }
+
+            append_output_tail(&output_tail, &line);
+            if let Some((uploaded_bytes, total_bytes, progress_percent, speed_hint)) =
+                parse_gcloud_progress_line(&line, task.file_size)
+            {
+                update_gcloud_progress_state(
+                    &handle,
+                    &progress_state,
+                    &task,
+                    uploaded_bytes,
+                    total_bytes,
+                    progress_percent,
+                    speed_hint,
+                );
+                return;
+            }
+
+            append_log(&handle, level, line, None, None);
+        };
+
+        loop {
+            match buffered.read(&mut chunk) {
+                Ok(0) => {
+                    flush_segment(&current);
+                    break;
+                }
+                Ok(read_bytes) => {
+                    for byte in &chunk[..read_bytes] {
+                        if *byte == b'\n' || *byte == b'\r' {
+                            flush_segment(&current);
+                            current.clear();
+                            continue;
+                        }
+
+                        current.push(*byte);
+                    }
+                }
+                Err(_) => {
+                    flush_segment(&current);
+                    break;
+                }
+            }
         }
     });
 }
@@ -1848,15 +2093,30 @@ fn run_gcloud_import_task(
         set_active_pid(&handle, Some(pid));
 
         let output_tail = Arc::new(Mutex::new(Vec::<String>::new()));
+        let progress_state = Arc::new(Mutex::new(GcloudProgressState {
+            total_bytes: task.file_size,
+            ..Default::default()
+        }));
         if let Some(stdout) = child.stdout.take() {
-            read_child_output(stdout, handle.clone(), "debug", Arc::clone(&output_tail));
+            read_gcloud_child_output(
+                stdout,
+                handle.clone(),
+                "debug",
+                Arc::clone(&output_tail),
+                Arc::clone(&progress_state),
+                task.clone(),
+            );
         }
         if let Some(stderr) = child.stderr.take() {
-            read_child_output(stderr, handle.clone(), "warn", Arc::clone(&output_tail));
+            read_gcloud_child_output(
+                stderr,
+                handle.clone(),
+                "warn",
+                Arc::clone(&output_tail),
+                Arc::clone(&progress_state),
+                task.clone(),
+            );
         }
-
-        let mut last_uploaded_bytes = 0_u64;
-        let mut last_sampled_at: Option<Instant> = None;
         let status = loop {
             if handle.cancel_requested.load(Ordering::Relaxed) {
                 terminate_process(pid);
@@ -1874,32 +2134,23 @@ fn run_gcloud_import_task(
                     if let Some((uploaded_bytes, total_bytes)) =
                         get_gcloud_resumable_progress(&client, &task, started_at_system)
                     {
-                        let sampled_at = Instant::now();
-                        let delta_bytes = uploaded_bytes.saturating_sub(last_uploaded_bytes);
-                        let speed = if let Some(previous_sampled_at) = last_sampled_at {
-                            let elapsed_seconds =
-                                sampled_at.duration_since(previous_sampled_at).as_secs_f64().max(0.001);
-                            delta_bytes as f64 / elapsed_seconds
-                        } else {
+                        let progress_percent = if task.file_size == 0 {
                             0.0
+                        } else {
+                            (uploaded_bytes as f64 / task.file_size as f64) * 100.0
                         };
-
-                        last_uploaded_bytes = uploaded_bytes;
-                        last_sampled_at = Some(sampled_at);
-
-                        update_snapshot(&handle, |snapshot| {
-                            snapshot.status = AgentTaskStatus::Uploading;
-                            snapshot.uploaded_bytes = uploaded_bytes;
-                            snapshot.total_bytes = total_bytes.max(task.file_size);
-                            snapshot.progress =
-                                ((uploaded_bytes as f64 / task.file_size as f64) * 100.0).clamp(5.0, 88.0);
-                            if speed > 0.0 {
-                                snapshot.speed_bytes_per_second = speed;
-                            }
-                        });
+                        update_gcloud_progress_state(
+                            &handle,
+                            &progress_state,
+                            &task,
+                            uploaded_bytes,
+                            total_bytes,
+                            progress_percent,
+                            None,
+                        );
                     }
 
-                    thread::sleep(Duration::from_secs(3));
+                    thread::sleep(Duration::from_secs(1));
                 }
                 Err(error) => {
                     set_active_pid(&handle, None);
