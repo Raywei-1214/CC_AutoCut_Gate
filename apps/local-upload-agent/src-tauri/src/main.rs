@@ -1,6 +1,6 @@
 use mime_guess::MimeGuess;
 use reqwest::blocking::Client;
-use rfd::FileDialog;
+use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -35,7 +35,7 @@ const UPDATE_ENDPOINT: Option<&str> = option_env!("CHUANGCUT_AGENT_UPDATER_ENDPO
 const UPDATE_PUBKEY: Option<&str> = option_env!("CHUANGCUT_AGENT_UPDATER_PUBKEY");
 
 fn append_startup_log(message: impl AsRef<str>) {
-    let path = env::temp_dir().join("chuangcut-local-upload-agent-startup.log");
+    let path = startup_log_path();
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
@@ -45,6 +45,49 @@ fn append_startup_log(message: impl AsRef<str>) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = std::io::Write::write_all(&mut file, line.as_bytes());
     }
+}
+
+fn startup_log_path() -> PathBuf {
+    env::temp_dir().join("chuangcut-local-upload-agent-startup.log")
+}
+
+fn install_startup_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let location = panic_info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let payload = panic_info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| {
+                panic_info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .map(|message| message.clone())
+            })
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+
+        append_startup_log(format!("捕获到 panic（{location}）：{payload}"));
+        default_hook(panic_info);
+    }));
+}
+
+fn show_startup_error_dialog(message: impl AsRef<str>) {
+    let detail = format!(
+        "{}\n\n请把这个日志文件发给开发者：{}",
+        message.as_ref(),
+        startup_log_path().display()
+    );
+
+    let _ = MessageDialog::new()
+        .set_title("创剪本地上传助手启动失败")
+        .set_level(MessageLevel::Error)
+        .set_description(&detail)
+        .set_buttons(MessageButtons::Ok)
+        .show();
 }
 
 #[derive(Clone)]
@@ -2288,13 +2331,19 @@ fn hide_main_window(app: &tauri::AppHandle) {
 }
 
 fn main() {
+    append_startup_log("main() entered");
+    install_startup_panic_hook();
+    append_startup_log("startup panic hook installed");
+
     let updater_plugin = if let Some(pubkey) = UPDATE_PUBKEY.filter(|value| !value.trim().is_empty()) {
         tauri_plugin_updater::Builder::new().pubkey(pubkey.to_string())
     } else {
         tauri_plugin_updater::Builder::new()
     };
 
-    tauri::Builder::default()
+    append_startup_log("即将进入 tauri 启动流程");
+
+    let run_result = tauri::Builder::default()
         .plugin(updater_plugin.build())
         .on_window_event(|window, event| {
             if window.label() != "main" {
@@ -2306,13 +2355,20 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .setup(|app| {
+        .setup(|app| -> Result<(), Box<dyn std::error::Error>> {
             append_startup_log("开始执行桌面助手启动流程");
-            let client = Client::builder()
+            let client = match Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(DEFAULT_CHUNK_TIMEOUT_SECONDS))
                 .build()
-                .expect("build http client");
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    append_startup_log(format!("创建 HTTP 客户端失败：{error}"));
+                    show_startup_error_dialog(format!("初始化网络模块失败：{error}"));
+                    return Err(Box::new(error));
+                }
+            };
 
             let state = Arc::new(AgentHttpState {
                 version: app.package_info().version.to_string(),
@@ -2381,6 +2437,13 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("run tauri app");
+        .run(tauri::generate_context!());
+
+    match run_result {
+        Ok(()) => append_startup_log("tauri 事件循环已正常退出"),
+        Err(error) => {
+            append_startup_log(format!("tauri 启动失败：{error}"));
+            show_startup_error_dialog(format!("桌面助手启动失败：{error}"));
+        }
+    }
 }
