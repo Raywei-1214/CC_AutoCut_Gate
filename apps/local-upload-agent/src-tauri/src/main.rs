@@ -1342,11 +1342,19 @@ fn gcloud_config_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
-fn gcloud_tracker_dir() -> PathBuf {
-    gcloud_config_dir()
+fn gcloud_tracker_dir(auth_context: Option<&GcloudAuthContext>) -> PathBuf {
+    auth_context
+        .map(|context| context.config_dir.clone())
+        .unwrap_or_else(gcloud_config_dir)
         .join("surface_data")
         .join("storage")
         .join("tracker_files")
+}
+
+fn tracker_serialization_data(path: &Path) -> Option<Value> {
+    let tracker = fs::read_to_string(path).ok()?;
+    let tracker = serde_json::from_str::<Value>(&tracker).ok()?;
+    tracker.get("serialization_data").cloned()
 }
 
 fn parse_gcloud_uploaded_bytes(range_header: Option<&str>) -> Option<u64> {
@@ -1374,9 +1382,7 @@ fn query_tracker_progress(
     client: &Client,
     tracker_file_path: &Path,
 ) -> Option<(u64, u64)> {
-    let tracker = fs::read_to_string(tracker_file_path).ok()?;
-    let tracker = serde_json::from_str::<Value>(&tracker).ok()?;
-    let serialization_data = tracker.get("serialization_data")?;
+    let serialization_data = tracker_serialization_data(tracker_file_path)?;
     let total_bytes = serialization_data.get("total_size")?.as_u64()?;
     let upload_url = serialization_data.get("url")?.as_str()?;
     if total_bytes == 0 || upload_url.trim().is_empty() {
@@ -1405,63 +1411,39 @@ fn query_tracker_progress(
     Some((uploaded_bytes.min(total_bytes), total_bytes))
 }
 
-fn find_gcloud_tracker_file(task: &AgentUploadTask, started_at: SystemTime) -> Option<PathBuf> {
-    let tracker_dir = gcloud_tracker_dir();
-    let normalized_file_name = Path::new(&task.local_file_path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+fn find_gcloud_tracker_file(
+    task: &AgentUploadTask,
+    tracker_dir: &Path,
+    started_at: SystemTime,
+) -> Option<PathBuf> {
+    let tracker_entries = fs::read_dir(tracker_dir).ok()?;
 
-    fs::read_dir(tracker_dir)
-        .ok()?
+    tracker_entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|path| {
             let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
             file_name.starts_with("upload_TRACKER_")
                 && file_name.ends_with("__gs.url")
-                && file_name.to_lowercase().contains(&normalized_file_name)
         })
         .filter_map(|path| tracker_file_mtime_ok(&path, started_at).map(|mtime| (path, mtime)))
+        .filter(|(path, _)| {
+            tracker_serialization_data(path)
+                .and_then(|data| data.get("total_size").and_then(Value::as_u64))
+                .map(|total_size| total_size == task.file_size)
+                .unwrap_or(true)
+        })
         .max_by_key(|(_, mtime)| *mtime)
         .map(|(path, _)| path)
 }
 
 fn find_gcloud_parallel_tracker_files(
-    task: &AgentUploadTask,
+    tracker_dir: &Path,
     started_at: SystemTime,
 ) -> Option<Vec<PathBuf>> {
-    let tracker_dir = gcloud_tracker_dir();
-    let normalized_file_name = Path::new(&task.local_file_path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
     let entries = fs::read_dir(tracker_dir).ok()?;
-    let mut manifest_anchor_time =
-        started_at.checked_sub(Duration::from_secs(60)).unwrap_or(started_at);
-    let mut grouped = HashMap::<String, Vec<(PathBuf, SystemTime)>>::new();
+    let mut trackers = Vec::<(PathBuf, SystemTime)>::new();
 
-    for entry in entries.filter_map(|value| value.ok()) {
-        let path = entry.path();
-        let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
-        let file_name_lower = file_name.to_lowercase();
-
-        if file_name.starts_with("parallel_upload_TRACKER_")
-            && file_name.ends_with("__gs.url")
-            && file_name_lower.contains(&normalized_file_name)
-        {
-            if let Some(mtime) = tracker_file_mtime_ok(&path, started_at) {
-                if mtime > manifest_anchor_time {
-                    manifest_anchor_time = mtime;
-                }
-            }
-        }
-    }
-
-    let entries = fs::read_dir(gcloud_tracker_dir()).ok()?;
     for entry in entries.filter_map(|value| value.ok()) {
         let path = entry.path();
         let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
@@ -1471,42 +1453,36 @@ fn find_gcloud_parallel_tracker_files(
             continue;
         }
 
-        let Some((group_key, _)) = file_name.split_once("__gs.url_") else {
-            continue;
-        };
-
         if let Some(mtime) = tracker_file_mtime_ok(&path, started_at) {
-            if mtime < manifest_anchor_time {
-                continue;
-            }
-            grouped
-                .entry(group_key.to_string())
-                .or_default()
-                .push((path, mtime));
+            trackers.push((path, mtime));
         }
     }
 
-    grouped
-        .into_values()
-        .filter(|group| !group.is_empty())
-        .max_by_key(|group| group.iter().map(|(_, mtime)| *mtime).max())
-        .map(|mut group| {
-            group.sort_by(|left, right| left.0.cmp(&right.0));
-            group.into_iter().map(|(path, _)| path).collect::<Vec<_>>()
-        })
+    if trackers.is_empty() {
+        return None;
+    }
+
+    trackers.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    Some(trackers.into_iter().map(|(path, _)| path).collect())
 }
 
 fn get_gcloud_resumable_progress(
     client: &Client,
     task: &AgentUploadTask,
+    tracker_dir: &Path,
     started_at: SystemTime,
 ) -> Option<(u64, u64)> {
-    if let Some(tracker_file_path) = find_gcloud_tracker_file(task, started_at) {
+    if let Some(tracker_file_path) = find_gcloud_tracker_file(task, tracker_dir, started_at) {
         return query_tracker_progress(client, &tracker_file_path)
             .map(|(uploaded_bytes, total_bytes)| (uploaded_bytes.min(task.file_size), total_bytes));
     }
 
-    let tracker_files = find_gcloud_parallel_tracker_files(task, started_at)?;
+    let tracker_files = find_gcloud_parallel_tracker_files(tracker_dir, started_at)?;
     if tracker_files.is_empty() {
         return None;
     }
@@ -2101,6 +2077,14 @@ fn run_gcloud_import_task(
             total_bytes: task.file_size,
             ..Default::default()
         }));
+        let tracker_dir = gcloud_tracker_dir(auth_context_for_cleanup.as_ref());
+        append_log(
+            &handle,
+            "debug",
+            "GCloud 进度跟踪目录已解析",
+            None,
+            Some(tracker_dir.display().to_string()),
+        );
         if let Some(stdout) = child.stdout.take() {
             read_gcloud_child_output(
                 stdout,
@@ -2136,7 +2120,7 @@ fn run_gcloud_import_task(
                 }
                 Ok(None) => {
                     if let Some((uploaded_bytes, total_bytes)) =
-                        get_gcloud_resumable_progress(&client, &task, started_at_system)
+                        get_gcloud_resumable_progress(&client, &task, &tracker_dir, started_at_system)
                     {
                         let progress_percent = if task.file_size == 0 {
                             0.0
@@ -2873,6 +2857,108 @@ fn show_main_window(app: &tauri::AppHandle) {
 fn hide_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_temp_dir(label: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("chuangcut-agent-test-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_tracker(path: &Path, total_size: Option<u64>) {
+        let payload = match total_size {
+            Some(total_size) => json!({
+                "serialization_data": {
+                    "total_size": total_size,
+                    "url": "https://example.com/upload"
+                }
+            }),
+            None => json!({
+                "encryption_key_sha256": null,
+                "random_prefix": "2767933517"
+            }),
+        };
+        fs::write(path, payload.to_string()).expect("write tracker file");
+    }
+
+    fn sample_task(file_size: u64) -> AgentUploadTask {
+        AgentUploadTask {
+            task_id: "task-1".to_string(),
+            base_url: "https://example.com".to_string(),
+            file_name: "demo.mp4".to_string(),
+            file_size,
+            mime_type: "video/mp4".to_string(),
+            local_file_path: "/tmp/demo.mp4".to_string(),
+            api_token: "token".to_string(),
+            bucket_name: Some("bucket".to_string()),
+            object_prefix: Some("prefix".to_string()),
+            service_account_json: None,
+        }
+    }
+
+    #[test]
+    fn gcloud_tracker_dir_prefers_auth_context_config_dir() {
+        let config_dir = create_temp_dir("gcloud-config");
+        let auth_context = GcloudAuthContext {
+            temp_dir: config_dir.parent().unwrap_or(&config_dir).to_path_buf(),
+            config_dir: config_dir.clone(),
+            key_file_path: config_dir.join("service-account.json"),
+            project_id: None,
+            client_email: None,
+        };
+
+        let tracker_dir = gcloud_tracker_dir(Some(&auth_context));
+        assert_eq!(
+            tracker_dir,
+            config_dir.join("surface_data").join("storage").join("tracker_files")
+        );
+
+        let _ = fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn find_gcloud_tracker_file_matches_recent_tracker_without_filename_hint() {
+        let tracker_dir = create_temp_dir("single-tracker");
+        let started_at = SystemTime::now();
+        let task = sample_task(1024);
+
+        let mismatch = tracker_dir.join("upload_TRACKER_old.__gs.url");
+        write_tracker(&mismatch, Some(2048));
+
+        let target = tracker_dir.join("upload_TRACKER_a1b2c3.__gs.url");
+        write_tracker(&target, Some(1024));
+
+        let found = find_gcloud_tracker_file(&task, &tracker_dir, started_at);
+        assert_eq!(found.as_deref(), Some(target.as_path()));
+
+        let _ = fs::remove_dir_all(tracker_dir);
+    }
+
+    #[test]
+    fn find_gcloud_parallel_tracker_files_collects_recent_chunk_trackers() {
+        let tracker_dir = create_temp_dir("parallel-tracker");
+        let started_at = SystemTime::now();
+
+        write_tracker(
+            &tracker_dir.join("parallel_upload_TRACKER_manifest.load.bin__gs.url"),
+            None,
+        );
+        let chunk_a = tracker_dir.join("upload_TRACKER_chunkhash.__gs.url_0");
+        let chunk_b = tracker_dir.join("upload_TRACKER_chunkhash.__gs.url_1");
+        write_tracker(&chunk_a, Some(128));
+        write_tracker(&chunk_b, Some(128));
+
+        let found = find_gcloud_parallel_tracker_files(&tracker_dir, started_at)
+            .expect("parallel trackers should be detected");
+
+        assert_eq!(found, vec![chunk_a, chunk_b]);
+
+        let _ = fs::remove_dir_all(tracker_dir);
     }
 }
 
