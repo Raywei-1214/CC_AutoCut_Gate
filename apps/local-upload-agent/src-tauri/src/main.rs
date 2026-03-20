@@ -843,7 +843,7 @@ fn update_gcloud_progress_state(
         snapshot.status = AgentTaskStatus::Uploading;
         snapshot.uploaded_bytes = next_uploaded_bytes;
         snapshot.total_bytes = next_total_bytes;
-        snapshot.progress = next_progress_percent.clamp(5.0, 88.0);
+        snapshot.progress = next_progress_percent.clamp(1.0, 88.0);
         if next_speed_bytes_per_second > 0.0 {
             snapshot.speed_bytes_per_second = next_speed_bytes_per_second;
         }
@@ -2020,7 +2020,7 @@ fn run_gcloud_import_task(
         append_log(&handle, "debug", "GCloud 导入任务已创建", None, None);
         update_snapshot(&handle, |snapshot| {
             snapshot.status = AgentTaskStatus::Uploading;
-            snapshot.progress = 5.0;
+            snapshot.progress = 1.0;
             snapshot.uploaded_bytes = 0;
             snapshot.total_bytes = task.file_size;
             snapshot.speed_bytes_per_second = 0.0;
