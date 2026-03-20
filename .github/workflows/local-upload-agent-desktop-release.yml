@@ -1,0 +1,225 @@
+name: Local Upload Agent Desktop Release
+
+concurrency:
+  group: local-upload-agent-desktop-release-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    tags:
+      - 'local-upload-agent-v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            tauri_target: aarch64-apple-darwin
+            artifact_name: local-upload-agent-release-macos
+          - os: windows-latest
+            tauri_target: x86_64-pc-windows-msvc
+            artifact_name: local-upload-agent-release-windows
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CHUANGCUT_AGENT_UNSIGNED_RELEASE: 'true'
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      CHUANGCUT_AGENT_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+      CHUANGCUT_AGENT_UPDATER_ENDPOINT: ${{ vars.CHUANGCUT_AGENT_UPDATER_ENDPOINT != '' && vars.CHUANGCUT_AGENT_UPDATER_ENDPOINT || format('https://github.com/{0}/releases/latest/download/latest.json', github.repository) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.tauri_target }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure release build
+        if: env.CHUANGCUT_AGENT_UNSIGNED_RELEASE != 'true'
+        env:
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          WINDOWS_DIGEST_ALGORITHM: ${{ secrets.WINDOWS_DIGEST_ALGORITHM }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: node ./scripts/local-upload-agent-desktop-configure-release.mjs
+
+      - name: Import Apple certificate
+        if: runner.os == 'macOS' && env.CHUANGCUT_AGENT_UNSIGNED_RELEASE != 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import base64
+          import os
+
+          with open("certificate.p12", "wb") as file:
+              file.write(base64.b64decode(os.environ["APPLE_CERTIFICATE"]))
+          PY
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+
+      - name: Import Windows certificate
+        if: runner.os == 'Windows' && env.CHUANGCUT_AGENT_UNSIGNED_RELEASE != 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          [System.IO.File]::WriteAllBytes("$pwd\\certificate.pfx", [System.Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          Import-PfxCertificate -FilePath "$pwd\\certificate.pfx" -CertStoreLocation Cert:\CurrentUser\My -Password $password
+
+      - name: Build release bundle
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          tauri_args=(build --target "${{ matrix.tauri_target }}")
+
+          if [[ "${CHUANGCUT_AGENT_UNSIGNED_RELEASE}" == "true" ]]; then
+            tauri_args+=(--no-sign)
+          fi
+
+          pnpm --dir apps/local-upload-agent exec tauri "${tauri_args[@]}"
+
+      - name: Create portable archive (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          DMG_PATH="$(find apps/local-upload-agent/src-tauri/target -path '*/bundle/dmg/*.dmg' -print | head -n 1)"
+          if [[ -z "${DMG_PATH}" ]]; then
+            find apps/local-upload-agent/src-tauri/target -maxdepth 6 -type d -print || true
+            echo "未找到 macOS dmg"
+            exit 1
+          fi
+
+          mkdir -p portable-assets
+          MOUNT_POINT="$(mktemp -d /tmp/chuangcut-agent-dmg.XXXXXX)"
+          trap 'hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true; rmdir "${MOUNT_POINT}" >/dev/null 2>&1 || true' EXIT
+          hdiutil attach "${DMG_PATH}" -nobrowse -readonly -mountpoint "${MOUNT_POINT}" >/dev/null
+
+          APP_BUNDLE="$(find "${MOUNT_POINT}" -maxdepth 2 -type d -name '*.app' | head -n 1)"
+          if [[ -z "${APP_BUNDLE}" ]]; then
+            echo "dmg 内未找到 macOS app bundle"
+            exit 1
+          fi
+
+          ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" portable-assets/ChuangCutLocalUploadAgent-macos-portable.zip
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          shopt -s nullglob
+          mkdir -p release-assets
+          files=()
+
+          add_first_match() {
+            local pattern="$1"
+            local match
+            match="$(find apps/local-upload-agent/src-tauri/target -path "${pattern}" -print | head -n 1)"
+            if [[ -n "${match}" ]]; then
+              files+=("${match}")
+            fi
+          }
+
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            add_first_match '*/bundle/dmg/*.dmg'
+            files+=(portable-assets/ChuangCutLocalUploadAgent-macos-portable.zip)
+            if [[ "${CHUANGCUT_AGENT_UNSIGNED_RELEASE}" != "true" ]]; then
+              add_first_match '*/bundle/macos/*.app.tar.gz'
+              add_first_match '*/bundle/macos/*.app.tar.gz.sig'
+            fi
+          else
+            add_first_match '*/bundle/nsis/*.exe'
+            add_first_match '*/bundle/msi/*.msi'
+            if [[ "${CHUANGCUT_AGENT_UNSIGNED_RELEASE}" != "true" ]]; then
+              add_first_match '*/bundle/msi/*.msi.zip'
+              add_first_match '*/bundle/msi/*.msi.zip.sig'
+            fi
+          fi
+
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            find apps/local-upload-agent/src-tauri/target -maxdepth 8 -print || true
+            echo "未找到任何发版产物"
+            exit 1
+          fi
+
+          cp "${files[@]}" release-assets/
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      CHUANGCUT_AGENT_UNSIGNED_RELEASE: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Generate updater manifest
+        if: env.CHUANGCUT_AGENT_UNSIGNED_RELEASE != 'true'
+        run: |
+          VERSION="${GITHUB_REF_NAME#local-upload-agent-v}"
+          node ./scripts/local-upload-agent-desktop-generate-update-manifest.mjs \
+            --assets-dir=release-assets \
+            --repo=${GITHUB_REPOSITORY} \
+            --tag=${GITHUB_REF_NAME} \
+            --version=${VERSION} \
+            --notes="See GitHub release notes."
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release_notes="Unsigned beta build for internal testing. Prefer macOS portable zip and Windows setup.exe; keep .dmg / .msi as fallback installers."
+
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" --title "ChuangCut Local Upload Agent ${GITHUB_REF_NAME#local-upload-agent-v}" --notes "${release_notes}"
+          fi
+          find release-assets -type f -print0 | xargs -0 gh release upload "${GITHUB_REF_NAME}" --clobber

@@ -1,0 +1,24 @@
+[package]
+name = "chuangcut-local-upload-agent"
+version = "0.1.0"
+description = "创剪本地上传助手安装版骨架"
+authors = ["拾米工作流"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mime_guess = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-updater = "2.10.0"
+tiny_http = "0.12"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = []

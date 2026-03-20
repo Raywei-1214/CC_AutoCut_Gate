@@ -1,0 +1,16 @@
+{
+  "name": "@chuangcut/local-upload-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "创剪本地上传助手桌面版骨架（Tauri）",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "lint": "biome check src package.json README.md src-tauri/tauri.conf.json",
+    "format": "biome format --write src package.json README.md src-tauri/tauri.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.1"
+  }
+}

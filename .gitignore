@@ -1,0 +1,6 @@
+node_modules/
+.pnpm-store/
+apps/local-upload-agent/node_modules/
+apps/local-upload-agent/src-tauri/target/
+.DS_Store
+*.log

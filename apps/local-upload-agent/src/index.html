@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0"
+    />
+    <title>创剪本地上传助手</title>
+    <link
+      rel="stylesheet"
+      href="./styles.css"
+    />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">ChuangCut Local Agent</p>
+        <h1>创剪本地上传助手</h1>
+        <p class="summary">
+          当前已经具备最小可用的桌面上传能力：原生选文件、并发分片上传、
+          localhost 协议和托盘常驻。
+        </p>
+        <p class="summary summary-secondary">
+          现阶段仍会参考
+          <code>scripts/local-upload-agent.ts</code>
+          的协议约定，但核心上传流程已经开始迁入这个桌面应用。
+        </p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>服务状态</h2>
+          <div class="action-row">
+            <button
+              id="pick-file-button"
+              type="button"
+            >
+              选择视频
+            </button>
+            <button
+              id="refresh-button"
+              type="button"
+            >
+              刷新
+            </button>
+          </div>
+        </div>
+        <dl class="status-grid">
+          <div>
+            <dt>本地接口</dt>
+            <dd id="status-health">检查中...</dd>
+          </div>
+          <div>
+            <dt>监听地址</dt>
+            <dd>http://127.0.0.1:17777</dd>
+          </div>
+          <div>
+            <dt>桌面壳版本</dt>
+            <dd id="status-version">0.1.0</dd>
+          </div>
+          <div>
+            <dt>当前平台</dt>
+            <dd id="status-platform">检测中...</dd>
+          </div>
+          <div class="status-wide">
+            <dt>已启用能力</dt>
+            <dd id="status-capabilities">检测中...</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>自动更新</h2>
+          <div class="action-row">
+            <button
+              id="check-update-button"
+              type="button"
+            >
+              检查更新
+            </button>
+            <button
+              id="install-update-button"
+              type="button"
+              class="ghost-button"
+            >
+              安装更新
+            </button>
+          </div>
+        </div>
+        <dl class="status-grid">
+          <div>
+            <dt>更新状态</dt>
+            <dd id="update-status">未检查</dd>
+          </div>
+          <div>
+            <dt>当前版本</dt>
+            <dd id="update-current-version">0.1.0</dd>
+          </div>
+          <div>
+            <dt>最新版本</dt>
+            <dd id="update-latest-version">-</dd>
+          </div>
+          <div>
+            <dt>下载进度</dt>
+            <dd id="update-progress">0%</dd>
+          </div>
+          <div class="status-wide">
+            <dt>更新说明</dt>
+            <dd id="update-notes">当前未检测到更新。</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>上传任务</h2>
+          <button
+            id="export-logs-button"
+            type="button"
+          >
+            导出日志
+          </button>
+        </div>
+        <p
+          id="task-empty"
+          class="empty-state"
+        >
+          当前还没有上传任务。
+        </p>
+        <div
+          id="task-list"
+          class="task-list"
+        ></div>
+      </section>
+
+      <section class="panel">
+        <h2>下一步迁移</h2>
+        <ol class="roadmap">
+          <li>把自动更新接到正式 GitHub Release 发布流</li>
+          <li>补齐 macOS / Windows 证书和签名密钥</li>
+          <li>按需求继续增强托盘任务面板</li>
+        </ol>
+      </section>
+    </main>
+
+    <script
+      type="module"
+      src="./main.js"
+    ></script>
+  </body>
+</html>
