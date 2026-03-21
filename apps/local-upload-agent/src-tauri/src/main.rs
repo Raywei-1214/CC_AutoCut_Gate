@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use tauri::{
     AppHandle,
     menu::{Menu, MenuItem},
@@ -39,6 +41,8 @@ const UPDATE_ENDPOINT: Option<&str> = option_env!("CHUANGCUT_AGENT_UPDATER_ENDPO
 const UPDATE_PUBKEY: Option<&str> = option_env!("CHUANGCUT_AGENT_UPDATER_PUBKEY");
 const AUTOSTART_ARG: &str = "--autostart";
 const SHOW_WINDOW_ARG: &str = "--show-window";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone)]
 struct GcloudCommandSpec {
@@ -80,6 +84,13 @@ fn append_startup_log(message: impl AsRef<str>) {
 
 fn startup_log_path() -> PathBuf {
     env::temp_dir().join("chuangcut-local-upload-agent-startup.log")
+}
+
+fn configure_background_command(_command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        _command.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 fn install_startup_panic_hook() {
@@ -653,7 +664,9 @@ fn set_active_pid(handle: &TaskHandle, pid: Option<u32>) {
 fn terminate_process(pid: u32) {
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("taskkill")
+        let mut command = Command::new("taskkill");
+        configure_background_command(&mut command);
+        let _ = command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1035,6 +1048,7 @@ fn cleanup_gcloud_auth_context(handle: &TaskHandle, auth_context: GcloudAuthCont
 
 fn build_gcloud_command(spec: &GcloudCommandSpec, args: &[&str]) -> Command {
     let mut command = Command::new(&spec.program);
+    configure_background_command(&mut command);
     command.args(&spec.prefix_args);
     command.args(args);
     command
@@ -1078,7 +1092,9 @@ fn windows_gcloud_install_candidates() -> Vec<PathBuf> {
 #[cfg(target_os = "windows")]
 fn resolve_gcloud_command() -> Result<GcloudCommandSpec, String> {
     for candidate in ["gcloud.cmd", "gcloud.exe", "gcloud"] {
-        let output = Command::new("where.exe").arg(candidate).output();
+        let mut command = Command::new("where.exe");
+        configure_background_command(&mut command);
+        let output = command.arg(candidate).output();
         if let Ok(output) = output {
             if output.status.success() {
                 if let Some(line) = String::from_utf8_lossy(&output.stdout)
