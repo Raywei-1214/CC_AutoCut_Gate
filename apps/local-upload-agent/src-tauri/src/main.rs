@@ -976,8 +976,101 @@ fn build_gcloud_env_vars() -> Vec<(String, String)> {
     vars
 }
 
+#[cfg(not(target_os = "windows"))]
+fn python_version_supported_for_gcloud(python_path: &str) -> bool {
+    Command::new(python_path)
+        .args([
+            "-c",
+            "import sys; sys.exit(0 if ((3, 8) <= (sys.version_info.major, sys.version_info.minor) <= (3, 13)) else 1)",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_python_via_shell(shell: &str) -> Option<String> {
+    let shell_path = Path::new(shell);
+    if !shell_path.is_file() {
+        return None;
+    }
+
+    for args in [
+        ["-lc", "command -v python3 || command -v python"],
+        ["-ic", "command -v python3 || command -v python"],
+    ] {
+        let output = Command::new(shell_path)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let resolved = stdout
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && Path::new(line).is_file())?
+            .to_string();
+
+        if python_version_supported_for_gcloud(&resolved) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_gcloud_python_path() -> Option<String> {
+    let mut candidates = Vec::<String>::new();
+
+    if command_exists_in_current_env("python3") {
+        candidates.push("python3".to_string());
+    }
+    if command_exists_in_current_env("python") {
+        candidates.push("python".to_string());
+    }
+
+    for shell in unix_shell_candidates() {
+        if let Some(resolved) = resolve_python_via_shell(&shell) {
+            if !candidates.contains(&resolved) {
+                candidates.push(resolved);
+            }
+        }
+    }
+
+    for candidate in [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+    ] {
+        let candidate = candidate.to_string();
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| python_version_supported_for_gcloud(candidate))
+}
+
 fn build_gcloud_command_envs(auth_context: Option<&GcloudAuthContext>) -> Vec<(String, String)> {
     let mut vars = build_gcloud_env_vars();
+
+    #[cfg(not(target_os = "windows"))]
+    if let Some(python_path) = resolve_gcloud_python_path() {
+        vars.push(("CLOUDSDK_PYTHON".to_string(), python_path.clone()));
+        vars.push(("CLOUDSDK_GSUTIL_PYTHON".to_string(), python_path.clone()));
+        vars.push(("CLOUDSDK_BQ_PYTHON".to_string(), python_path));
+    }
 
     if let Some(auth_context) = auth_context {
         vars.push((
@@ -1049,6 +1142,15 @@ fn cleanup_gcloud_auth_context(handle: &TaskHandle, auth_context: GcloudAuthCont
 fn build_gcloud_command(spec: &GcloudCommandSpec, args: &[&str]) -> Command {
     let mut command = Command::new(&spec.program);
     configure_background_command(&mut command);
+    for variable in [
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "__PYVENV_LAUNCHER__",
+    ] {
+        command.env_remove(variable);
+    }
     command.args(&spec.prefix_args);
     command.args(args);
     command
