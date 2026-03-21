@@ -3,13 +3,45 @@
   "files": {
     "includes": [
       "**",
+      "!**/.next",
       "!**/node_modules",
+      "!**/archived",
+      "!**/demo",
+      "!**/temp",
+      "!**/tmp",
+      "!**/output",
+      "!**/logs",
+      "!**/docs/test-reports",
+      "!**/data",
+      "!**/.cache",
       "!**/dist",
       "!**/build",
-      "!**/tmp",
+      "!**/next-env.d.ts",
       "!**/apps/local-upload-agent/src-tauri/gen",
+      "!**/scripts/migrations",
+      "!**/scripts/import-styles.js",
       "!**/*.css"
     ]
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": {
+          "level": "on"
+        }
+      }
+    }
+  },
+  "css": {
+    "linter": {
+      "enabled": false
+    },
+    "formatter": {
+      "enabled": false
+    },
+    "parser": {
+      "cssModules": true
+    }
   },
   "linter": {
     "enabled": true,

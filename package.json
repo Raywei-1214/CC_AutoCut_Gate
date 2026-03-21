@@ -1,15 +1,14 @@
 {
-  "name": "chuangcut-local-upload-agent-debug",
+  "name": "chuangcut-local-upload-agent-gate",
   "version": "0.1.0",
   "private": true,
-  "description": "创剪本地上传助手最小公有调试仓库",
+  "description": "创剪本地上传助手最小公有发版仓库",
   "scripts": {
     "agent:desktop:dev": "bash ./scripts/local-upload-agent-desktop-dev.sh",
     "agent:desktop:check": "bash ./scripts/local-upload-agent-desktop-check.sh",
     "agent:desktop:build": "bash ./scripts/local-upload-agent-desktop-build.sh",
     "agent:desktop:build:debug": "bash ./scripts/local-upload-agent-desktop-build-debug.sh"
   },
-  "packageManager": "pnpm@10.22.0",
   "devDependencies": {
     "@biomejs/biome": "^2.3.8"
   }
