@@ -12,6 +12,7 @@
         "title": "创剪本地上传助手",
         "width": 960,
         "height": 720,
+        "visible": false,
         "resizable": true,
         "fullscreen": false
       }

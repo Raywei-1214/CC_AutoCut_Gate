@@ -21,6 +21,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, WindowEvent, Wry,
 };
+use tauri_plugin_autostart::{ManagerExt as AutostartManagerExt, MacosLauncher};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use url::Url;
@@ -34,6 +35,8 @@ const DEFAULT_RETRY_COUNT: usize = 2;
 const DEFAULT_PARALLEL_UPLOADS: usize = 4;
 const UPDATE_ENDPOINT: Option<&str> = option_env!("CHUANGCUT_AGENT_UPDATER_ENDPOINT");
 const UPDATE_PUBKEY: Option<&str> = option_env!("CHUANGCUT_AGENT_UPDATER_PUBKEY");
+const AUTOSTART_ARG: &str = "--autostart";
+const SHOW_WINDOW_ARG: &str = "--show-window";
 
 #[derive(Clone)]
 struct GcloudCommandSpec {
@@ -2833,14 +2836,15 @@ fn handle_request(request: Request, state: &AgentHttpState) {
                             "auto-update",
                             "pick-file",
                             "upload-task",
-                            "gcloud-import",
-                            "gcloud-cli-orchestrated",
-                            "cancel-task",
-                            "concurrent-upload",
-                            "tray-resident"
-                        ]
-                    }
-                }),
+                        "gcloud-import",
+                        "gcloud-cli-orchestrated",
+                        "cancel-task",
+                        "concurrent-upload",
+                        "tray-resident",
+                        "login-autostart"
+                    ]
+                }
+            }),
             );
         }
         (Method::Get, "/v1/system/info") => {
@@ -2984,6 +2988,18 @@ fn hide_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn current_launch_args() -> Vec<String> {
+    env::args().collect()
+}
+
+fn launched_from_autostart() -> bool {
+    current_launch_args().iter().any(|arg| arg == AUTOSTART_ARG)
+}
+
+fn should_show_main_window_on_launch() -> bool {
+    cfg!(debug_assertions) || current_launch_args().iter().any(|arg| arg == SHOW_WINDOW_ARG)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3121,6 +3137,44 @@ fn main() {
 
     append_startup_log("即将进入 tauri 启动流程");
     let mut builder = tauri::Builder::default();
+    let launch_args = current_launch_args();
+    append_startup_log(format!("启动参数：{}", launch_args.join(" ")));
+    append_startup_log(format!(
+        "启动来源：{}",
+        if launched_from_autostart() {
+            "开机自启"
+        } else {
+            "手动启动"
+        }
+    ));
+    append_startup_log(format!(
+        "窗口启动策略：{}",
+        if should_show_main_window_on_launch() {
+            "显示主窗口"
+        } else {
+            "后台常驻"
+        }
+    ));
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args([AUTOSTART_ARG])
+                .macos_launcher(MacosLauncher::LaunchAgent)
+                .build(),
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder = builder.plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args([AUTOSTART_ARG])
+                .build(),
+        );
+    }
+
     if updater_configured() {
         append_startup_log("检测到有效的 updater 配置，注册 updater 插件");
         let updater_plugin = if let Some(pubkey) = UPDATE_PUBKEY.filter(|value| !value.trim().is_empty()) {
@@ -3173,9 +3227,23 @@ fn main() {
             spawn_local_http_server(state);
             append_startup_log("本地 HTTP 服务线程已启动");
 
+            match app.autolaunch().is_enabled() {
+                Ok(true) => append_startup_log("开机自启已启用"),
+                Ok(false) => match app.autolaunch().enable() {
+                    Ok(()) => append_startup_log("已启用开机自启"),
+                    Err(error) => append_startup_log(format!("启用开机自启失败：{error}")),
+                },
+                Err(error) => append_startup_log(format!("读取开机自启状态失败：{error}")),
+            }
+
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                append_startup_log("主窗口已请求显示");
+                if should_show_main_window_on_launch() {
+                    let _ = window.show();
+                    append_startup_log("主窗口已请求显示");
+                } else {
+                    let _ = window.hide();
+                    append_startup_log("主窗口保持隐藏，按后台常驻模式启动");
+                }
             } else {
                 append_startup_log("未找到主窗口");
             }
