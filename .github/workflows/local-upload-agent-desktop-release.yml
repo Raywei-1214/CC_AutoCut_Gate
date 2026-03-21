@@ -55,6 +55,35 @@ jobs:
         with:
           targets: ${{ matrix.tauri_target }}
 
+      - name: Prepare desktop helper build version
+        shell: bash
+        run: |
+          base_version="${GITHUB_REF_NAME#local-upload-agent-v}"
+          IFS='.' read -r major minor _ <<< "${base_version}"
+
+          if [[ -z "${major}" || -z "${minor}" ]]; then
+            echo "无法从 tag 解析桌面助手版本：${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+          build_version="${major}.${minor}.${CHUANGCUT_AGENT_RELEASE_REVISION}"
+          echo "本次桌面助手内部版本：${build_version}"
+
+          BUILD_VERSION="${build_version}" node <<'NODE'
+          const fs = require('node:fs');
+
+          const files = [
+            'apps/local-upload-agent/package.json',
+            'apps/local-upload-agent/src-tauri/tauri.conf.json',
+          ];
+
+          for (const file of files) {
+            const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
+            payload.version = process.env.BUILD_VERSION;
+            fs.writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`);
+          }
+          NODE
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
