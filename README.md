@@ -17,6 +17,7 @@ pnpm agent:desktop:sync:gate
 - `.github/workflows/local-upload-agent-desktop-release.yml`
 - `scripts/local-upload-agent-desktop-*`
 - 最小根配置：`package.json` / `pnpm-lock.yaml` / `pnpm-workspace.yaml` / `biome.json`
+- 为了兼容共享锁文件，Gate 根 `package.json` 会继承主仓的依赖矩阵和 `pnpm` 配置
 
 ## 发布流程
 
