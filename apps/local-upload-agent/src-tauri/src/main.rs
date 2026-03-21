@@ -957,7 +957,7 @@ fn build_gcloud_env_vars() -> Vec<(String, String)> {
     let enable_parallel_composite_upload = env::var("LOCAL_UPLOAD_AGENT_GCLOUD_PARALLEL_COMPOSITE_UPLOAD")
         .ok()
         .map(|value| value.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(!cfg!(target_os = "macos"));
+        .unwrap_or(true);
 
     if enable_parallel_composite_upload {
         vars.push((

@@ -26,6 +26,19 @@ pnpm agent:desktop:sync:gate
 3. 进入 Gate 仓库检查差异并提交推送
 4. 在 Gate 仓库打 tag：`local-upload-agent-v0.1.0`
 
+推荐改成在主仓直接执行：
+
+```bash
+pnpm agent:desktop:release:gate
+```
+
+这个命令会自动为 Gate 生成一个全新的唯一 tag，例如：
+
+- `local-upload-agent-v0.1.0-r1`
+- `local-upload-agent-v0.1.0-r2`
+
+避免反复覆盖同一个 Release。
+
 ## 注意
 
 - 不要把主业务代码和任何凭据放进这个仓库
