@@ -1,4 +1,4 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use mime_guess::MimeGuess;
 use regex::Regex;
@@ -941,23 +941,23 @@ fn build_gcloud_env_vars() -> Vec<(String, String)> {
         "CLOUDSDK_ACCESSIBILITY_SCREEN_READER".to_string(),
         "True".to_string(),
     ));
-    let disable_parallel_composite_upload = env::var("LOCAL_UPLOAD_AGENT_GCLOUD_PARALLEL_COMPOSITE_UPLOAD")
+    let enable_parallel_composite_upload = env::var("LOCAL_UPLOAD_AGENT_GCLOUD_PARALLEL_COMPOSITE_UPLOAD")
         .ok()
-        .map(|value| value.trim().eq_ignore_ascii_case("false"))
-        .unwrap_or(false);
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(!cfg!(target_os = "macos"));
 
-    if disable_parallel_composite_upload {
+    if enable_parallel_composite_upload {
+        vars.push((
+            "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED".to_string(),
+            "True".to_string(),
+        ));
+    } else {
         vars.push((
             "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED".to_string(),
             "False".to_string(),
         ));
         vars.push(("CLOUDSDK_STORAGE_PROCESS_COUNT".to_string(), "1".to_string()));
         vars.push(("CLOUDSDK_STORAGE_THREAD_COUNT".to_string(), "1".to_string()));
-    } else {
-        vars.push((
-            "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED".to_string(),
-            "True".to_string(),
-        ));
     }
 
     vars
