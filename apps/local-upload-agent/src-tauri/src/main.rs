@@ -1035,6 +1035,14 @@ fn build_gcloud_command(spec: &GcloudCommandSpec, args: &[&str]) -> Command {
     command
 }
 
+fn direct_gcloud_command_spec(program: impl Into<String>, display_path: impl Into<String>) -> GcloudCommandSpec {
+    GcloudCommandSpec {
+        program: program.into(),
+        prefix_args: Vec::new(),
+        display_path: display_path.into(),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn windows_gcloud_install_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
@@ -1126,12 +1134,128 @@ fn resolve_gcloud_command() -> Result<GcloudCommandSpec, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
+fn command_exists_in_current_env(program: &str) -> bool {
+    Command::new(program)
+        .arg("version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unix_shell_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if let Some(shell) = env::var_os("SHELL") {
+        let shell = shell.to_string_lossy().trim().to_string();
+        if !shell.is_empty() && !candidates.contains(&shell) {
+            candidates.push(shell);
+        }
+    }
+
+    for shell in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
+        let shell = shell.to_string();
+        if !candidates.contains(&shell) {
+            candidates.push(shell);
+        }
+    }
+
+    candidates
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_gcloud_via_shell(shell: &str) -> Option<GcloudCommandSpec> {
+    let shell_path = Path::new(shell);
+    if !shell_path.is_file() {
+        return None;
+    }
+
+    for args in [["-lc", "command -v gcloud"], ["-ic", "command -v gcloud"]] {
+        let output = Command::new(shell_path)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let resolved = stdout
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && Path::new(line).is_file())?
+            .to_string();
+
+        return Some(direct_gcloud_command_spec(
+            resolved.clone(),
+            resolved,
+        ));
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn push_unix_cask_candidates(base: &Path, candidates: &mut Vec<PathBuf>) {
+    let cask_root = base.join("Caskroom").join("google-cloud-sdk");
+    let Ok(entries) = fs::read_dir(cask_root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        candidates.push(
+            entry.path()
+                .join("google-cloud-sdk")
+                .join("bin")
+                .join("gcloud"),
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unix_gcloud_install_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/gcloud"),
+        PathBuf::from("/usr/local/bin/gcloud"),
+    ];
+
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join("google-cloud-sdk").join("bin").join("gcloud"));
+        candidates.push(home.join(".local").join("bin").join("gcloud"));
+    }
+
+    push_unix_cask_candidates(Path::new("/opt/homebrew"), &mut candidates);
+    push_unix_cask_candidates(Path::new("/usr/local"), &mut candidates);
+
+    candidates
+}
+
+#[cfg(not(target_os = "windows"))]
 fn resolve_gcloud_command() -> Result<GcloudCommandSpec, String> {
-    Ok(GcloudCommandSpec {
-        program: "gcloud".to_string(),
-        prefix_args: Vec::new(),
-        display_path: "gcloud".to_string(),
-    })
+    if command_exists_in_current_env("gcloud") {
+        return Ok(direct_gcloud_command_spec("gcloud", "gcloud"));
+    }
+
+    for shell in unix_shell_candidates() {
+        if let Some(spec) = resolve_gcloud_via_shell(&shell) {
+            return Ok(spec);
+        }
+    }
+
+    for candidate in unix_gcloud_install_candidates() {
+        if candidate.is_file() {
+            let resolved = candidate.to_string_lossy().to_string();
+            return Ok(direct_gcloud_command_spec(resolved.clone(), resolved));
+        }
+    }
+
+    Err("未检测到 gcloud CLI，请先安装并完成 gcloud auth login".to_string())
 }
 
 fn ensure_gcloud_installed() -> Result<GcloudCommandSpec, String> {
@@ -2959,6 +3083,34 @@ mod tests {
         assert_eq!(found, vec![chunk_a, chunk_b]);
 
         let _ = fs::remove_dir_all(tracker_dir);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolve_gcloud_via_shell_returns_none_for_missing_shell() {
+        assert!(resolve_gcloud_via_shell("/definitely/missing/shell").is_none());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_shell_candidates_prefers_current_shell_without_duplicates() {
+        let original_shell = env::var_os("SHELL");
+        unsafe {
+            env::set_var("SHELL", "/bin/zsh");
+        }
+
+        let candidates = unix_shell_candidates();
+        assert_eq!(candidates.first().map(String::as_str), Some("/bin/zsh"));
+        assert_eq!(candidates.iter().filter(|shell| shell.as_str() == "/bin/zsh").count(), 1);
+
+        match original_shell {
+            Some(value) => unsafe {
+                env::set_var("SHELL", value);
+            },
+            None => unsafe {
+                env::remove_var("SHELL");
+            },
+        }
     }
 }
 
