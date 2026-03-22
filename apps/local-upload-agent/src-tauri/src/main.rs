@@ -2,7 +2,7 @@
 
 use mime_guess::MimeGuess;
 use regex::Regex;
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, Proxy};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -101,6 +101,219 @@ fn configure_background_command(_command: &mut Command) {
     }
 }
 
+fn normalize_proxy_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.contains("://") {
+        return Some(trimmed.to_string());
+    }
+
+    if trimmed.to_ascii_lowercase().starts_with("socks") {
+        return Some(format!("socks5://{trimmed}"));
+    }
+
+    Some(format!("http://{trimmed}"))
+}
+
+fn explicit_proxy_env_url() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = env::var(key) {
+            if let Some(proxy_url) = normalize_proxy_url(&value) {
+                return Some(proxy_url);
+            }
+        }
+    }
+
+    None
+}
+
+fn should_use_system_proxy() -> bool {
+    match env::var("LOCAL_UPLOAD_AGENT_GCLOUD_USE_SYSTEM_PROXY") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "enabled"
+        ),
+        Err(_) => {
+            #[cfg(target_os = "macos")]
+            {
+                true
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_proxy_key_value(output: &str, key: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (left, right) = line.split_once(':')?;
+        if left.trim() == key {
+            let value = right.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn build_mac_system_proxy_url(output: &str, prefix: &str) -> Option<String> {
+    let enabled = parse_proxy_key_value(output, &format!("{prefix}Enable"))?;
+    if enabled != "1" {
+        return None;
+    }
+
+    let host = parse_proxy_key_value(output, &format!("{prefix}Proxy"))?;
+    let port = parse_proxy_key_value(output, &format!("{prefix}Port"))?;
+    normalize_proxy_url(&format!("{host}:{port}"))
+}
+
+#[cfg(target_os = "macos")]
+fn read_mac_system_proxy_url() -> Option<String> {
+    let mut command = Command::new("scutil");
+    configure_background_command(&mut command);
+    let output = command
+        .args(["--proxy"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    build_mac_system_proxy_url(&stdout, "HTTPS")
+        .or_else(|| build_mac_system_proxy_url(&stdout, "HTTP"))
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_proxy_server(proxy_server: &str) -> Option<String> {
+    let segments = proxy_server
+        .split(';')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if segments.is_empty() {
+        return None;
+    }
+
+    let protocol_first = segments
+        .iter()
+        .copied()
+        .find(|segment| segment.to_ascii_lowercase().starts_with("https="))
+        .or_else(|| {
+            segments
+                .iter()
+                .copied()
+                .find(|segment| segment.to_ascii_lowercase().starts_with("http="))
+        })
+        .or_else(|| {
+            segments
+                .iter()
+                .copied()
+                .find(|segment| segment.to_ascii_lowercase().starts_with("socks="))
+        })
+        .unwrap_or(segments[0]);
+
+    let value = if let Some((_, suffix)) = protocol_first.split_once('=') {
+        suffix.trim()
+    } else {
+        protocol_first
+    };
+
+    normalize_proxy_url(value)
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_system_proxy_url() -> Option<String> {
+    let command = concat!(
+        "$settings = Get-ItemProperty -Path ",
+        "\"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\"; ",
+        "if ($settings.ProxyEnable -eq 1 -and $settings.ProxyServer) { ",
+        "Write-Output $settings.ProxyServer }"
+    );
+
+    for executable in ["powershell.exe", "pwsh", "powershell"] {
+        let mut process = Command::new(executable);
+        configure_background_command(&mut process);
+        let output = process
+            .args(["-NoProfile", "-Command", command])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+
+        if let Ok(output) = output {
+            if !output.status.success() {
+                continue;
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(proxy_url) = parse_windows_proxy_server(&stdout) {
+                return Some(proxy_url);
+            }
+        }
+    }
+
+    None
+}
+
+fn get_system_proxy_url() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return read_mac_system_proxy_url();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return read_windows_system_proxy_url();
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+fn resolve_gcloud_proxy_url() -> Option<String> {
+    explicit_proxy_env_url().or_else(|| {
+        if should_use_system_proxy() {
+            get_system_proxy_url()
+        } else {
+            None
+        }
+    })
+}
+
+fn build_http_client(proxy_url: Option<&str>) -> Result<Client, reqwest::Error> {
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(DEFAULT_CHUNK_TIMEOUT_SECONDS));
+
+    if let Some(proxy_url) = proxy_url.filter(|value| !value.trim().is_empty()) {
+        builder = builder.proxy(Proxy::all(proxy_url)?);
+    }
+
+    builder.build()
+}
+
 fn install_startup_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -148,6 +361,7 @@ struct AgentHttpState {
     gcloud_auth_contexts: Arc<Mutex<HashMap<String, CachedGcloudAuthContext>>>,
     updater: Arc<Mutex<UpdaterRuntimeState>>,
     http: Client,
+    gcloud_probe_http: Client,
 }
 
 #[derive(Clone)]
@@ -963,6 +1177,20 @@ fn build_gcloud_env_vars() -> Vec<(String, String)> {
         "CLOUDSDK_ACCESSIBILITY_SCREEN_READER".to_string(),
         "True".to_string(),
     ));
+    if let Some(proxy_url) = resolve_gcloud_proxy_url() {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            vars.push((key.to_string(), proxy_url.clone()));
+        }
+        vars.push(("NO_PROXY".to_string(), "127.0.0.1,localhost".to_string()));
+        vars.push(("no_proxy".to_string(), "127.0.0.1,localhost".to_string()));
+    }
     let enable_parallel_composite_upload = env::var("LOCAL_UPLOAD_AGENT_GCLOUD_PARALLEL_COMPOSITE_UPLOAD")
         .ok()
         .map(|value| value.trim().eq_ignore_ascii_case("true"))
@@ -1811,6 +2039,43 @@ fn get_gcloud_resumable_progress(
     }
 }
 
+fn gcloud_tracker_probe_interval() -> Duration {
+    #[cfg(target_os = "macos")]
+    {
+        return Duration::from_secs(4);
+    }
+
+    #[allow(unreachable_code)]
+    Duration::from_secs(1)
+}
+
+fn gcloud_tracker_probe_idle_threshold() -> Duration {
+    #[cfg(target_os = "macos")]
+    {
+        return Duration::from_secs(3);
+    }
+
+    #[allow(unreachable_code)]
+    Duration::from_secs(0)
+}
+
+fn gcloud_progress_recently_updated(
+    progress_state: &Arc<Mutex<GcloudProgressState>>,
+    now: Instant,
+    idle_threshold: Duration,
+) -> bool {
+    if idle_threshold.is_zero() {
+        return false;
+    }
+
+    progress_state
+        .lock()
+        .ok()
+        .and_then(|state| state.last_sampled_at)
+        .map(|last_sampled_at| now.duration_since(last_sampled_at) < idle_threshold)
+        .unwrap_or(false)
+}
+
 fn read_chunk(file: &mut File, offset: u64, chunk_size: usize) -> Result<Vec<u8>, String> {
     file.seek(SeekFrom::Start(offset))
         .map_err(|error| format!("定位分片失败：{error}"))?;
@@ -2306,6 +2571,7 @@ fn run_gcloud_import_task(
     task: AgentUploadTask,
     handle: TaskHandle,
     client: Client,
+    gcloud_probe_client: Client,
     tasks: Arc<Mutex<HashMap<String, TaskHandle>>>,
     gcloud_auth_contexts: Arc<Mutex<HashMap<String, CachedGcloudAuthContext>>>,
 ) {
@@ -2395,6 +2661,9 @@ fn run_gcloud_import_task(
             total_bytes: task.file_size,
             ..Default::default()
         }));
+        let probe_interval = gcloud_tracker_probe_interval();
+        let probe_idle_threshold = gcloud_tracker_probe_idle_threshold();
+        let mut last_probe_at: Option<Instant> = None;
         let tracker_dir = gcloud_tracker_dir(auth_context_for_task.as_ref());
         append_log(
             &handle,
@@ -2437,23 +2706,38 @@ fn run_gcloud_import_task(
                     break status;
                 }
                 Ok(None) => {
-                    if let Some((uploaded_bytes, total_bytes)) =
-                        get_gcloud_resumable_progress(&client, &task, &tracker_dir, started_at_system)
-                    {
-                        let progress_percent = if task.file_size == 0 {
-                            0.0
-                        } else {
-                            (uploaded_bytes as f64 / task.file_size as f64) * 100.0
-                        };
-                        update_gcloud_progress_state(
-                            &handle,
-                            &progress_state,
-                            &task,
-                            uploaded_bytes,
-                            total_bytes,
-                            progress_percent,
-                            None,
-                        );
+                    let now = Instant::now();
+                    let probe_due = last_probe_at
+                        .map(|last_probe_at| now.duration_since(last_probe_at) >= probe_interval)
+                        .unwrap_or(true);
+                    let recent_progress =
+                        gcloud_progress_recently_updated(&progress_state, now, probe_idle_threshold);
+
+                    if probe_due && !recent_progress {
+                        last_probe_at = Some(now);
+                        if let Some((uploaded_bytes, total_bytes)) =
+                            get_gcloud_resumable_progress(
+                                &gcloud_probe_client,
+                                &task,
+                                &tracker_dir,
+                                started_at_system,
+                            )
+                        {
+                            let progress_percent = if task.file_size == 0 {
+                                0.0
+                            } else {
+                                (uploaded_bytes as f64 / task.file_size as f64) * 100.0
+                            };
+                            update_gcloud_progress_state(
+                                &handle,
+                                &progress_state,
+                                &task,
+                                uploaded_bytes,
+                                total_bytes,
+                                progress_percent,
+                                None,
+                            );
+                        }
                     }
 
                     thread::sleep(Duration::from_secs(1));
@@ -2820,6 +3104,7 @@ fn handle_create_gcloud_import(mut request: Request, state: &AgentHttpState) {
 
     let background_handle = handle.clone();
     let background_client = state.http.clone();
+    let background_gcloud_probe_client = state.gcloud_probe_http.clone();
     let background_tasks = Arc::clone(&state.tasks);
     let background_auth_contexts = Arc::clone(&state.gcloud_auth_contexts);
     thread::spawn(move || {
@@ -2827,6 +3112,7 @@ fn handle_create_gcloud_import(mut request: Request, state: &AgentHttpState) {
             upload_task,
             background_handle,
             background_client,
+            background_gcloud_probe_client,
             background_tasks,
             background_auth_contexts,
         );
@@ -3294,6 +3580,50 @@ mod tests {
         let _ = fs::remove_dir_all(tracker_dir);
     }
 
+    #[test]
+    fn normalize_proxy_url_adds_http_scheme_for_host_port() {
+        assert_eq!(
+            normalize_proxy_url("127.0.0.1:7897").as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(
+            normalize_proxy_url("https://127.0.0.1:7897").as_deref(),
+            Some("https://127.0.0.1:7897")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mac_system_proxy_url_parses_https_proxy_output() {
+        let output = r#"
+<dictionary> {
+  HTTPEnable : 0
+  HTTPSEnable : 1
+  HTTPSPort : 7897
+  HTTPSProxy : 127.0.0.1
+}
+"#;
+
+        assert_eq!(
+            build_mac_system_proxy_url(output, "HTTPS").as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+    }
+
+    #[test]
+    fn gcloud_progress_recently_updated_respects_idle_threshold() {
+        let state = Arc::new(Mutex::new(GcloudProgressState {
+            last_sampled_at: Some(Instant::now()),
+            ..Default::default()
+        }));
+
+        assert!(gcloud_progress_recently_updated(
+            &state,
+            Instant::now(),
+            Duration::from_secs(3),
+        ));
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn resolve_gcloud_via_shell_returns_none_for_missing_shell() {
@@ -3393,16 +3723,25 @@ fn main() {
         })
         .setup(|app| -> Result<(), Box<dyn std::error::Error>> {
             append_startup_log("开始执行桌面助手启动流程");
-            let client = match Client::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .timeout(Duration::from_secs(DEFAULT_CHUNK_TIMEOUT_SECONDS))
-                .build()
-            {
+            let client = match build_http_client(None) {
                 Ok(client) => client,
                 Err(error) => {
                     append_startup_log(format!("创建 HTTP 客户端失败：{error}"));
                     show_startup_error_dialog(format!("初始化网络模块失败：{error}"));
                     return Err(Box::new(error));
+                }
+            };
+            let gcloud_proxy_url = resolve_gcloud_proxy_url();
+            if let Some(proxy_url) = gcloud_proxy_url.as_deref() {
+                append_startup_log(format!("GCloud 代理已启用：{proxy_url}"));
+            } else {
+                append_startup_log("GCloud 代理未启用，将直连网络".to_string());
+            }
+            let gcloud_probe_http = match build_http_client(gcloud_proxy_url.as_deref()) {
+                Ok(client) => client,
+                Err(error) => {
+                    append_startup_log(format!("创建 GCloud 探测 HTTP 客户端失败，回退为直连：{error}"));
+                    client.clone()
                 }
             };
 
@@ -3416,6 +3755,7 @@ fn main() {
                     snapshot: default_updater_snapshot(app.package_info().version.to_string()),
                 })),
                 http: client,
+                gcloud_probe_http,
             });
 
             if let Err(error) = spawn_local_http_server(state) {
