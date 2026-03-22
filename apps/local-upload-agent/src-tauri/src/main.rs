@@ -2033,6 +2033,10 @@ fn get_gcloud_resumable_progress(
 }
 
 fn gcloud_tracker_probe_interval() -> Duration {
+    if !gcloud_tracker_probe_enabled() {
+        return Duration::from_secs(u64::MAX);
+    }
+
     #[cfg(target_os = "macos")]
     {
         return Duration::from_secs(4);
@@ -2043,6 +2047,10 @@ fn gcloud_tracker_probe_interval() -> Duration {
 }
 
 fn gcloud_tracker_probe_idle_threshold() -> Duration {
+    if !gcloud_tracker_probe_enabled() {
+        return Duration::ZERO;
+    }
+
     #[cfg(target_os = "macos")]
     {
         return Duration::from_secs(3);
@@ -2050,6 +2058,25 @@ fn gcloud_tracker_probe_idle_threshold() -> Duration {
 
     #[allow(unreachable_code)]
     Duration::from_secs(0)
+}
+
+fn gcloud_tracker_probe_enabled() -> bool {
+    if let Ok(value) = env::var("LOCAL_UPLOAD_AGENT_GCLOUD_TRACKER_PROBE") {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "enabled"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        false
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
 }
 
 fn gcloud_progress_recently_updated(
@@ -2654,6 +2681,7 @@ fn run_gcloud_import_task(
             total_bytes: task.file_size,
             ..Default::default()
         }));
+        let probe_enabled = gcloud_tracker_probe_enabled();
         let probe_interval = gcloud_tracker_probe_interval();
         let probe_idle_threshold = gcloud_tracker_probe_idle_threshold();
         let mut last_probe_at: Option<Instant> = None;
@@ -2706,7 +2734,7 @@ fn run_gcloud_import_task(
                     let recent_progress =
                         gcloud_progress_recently_updated(&progress_state, now, probe_idle_threshold);
 
-                    if probe_due && !recent_progress {
+                    if probe_enabled && probe_due && !recent_progress {
                         last_probe_at = Some(now);
                         if let Some((uploaded_bytes, total_bytes)) =
                             get_gcloud_resumable_progress(
