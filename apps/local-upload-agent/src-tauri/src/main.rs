@@ -167,7 +167,7 @@ fn parse_proxy_key_value(output: &str, key: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn build_mac_system_proxy_url(output: &str, prefix: &str) -> Option<String> {
+fn build_mac_system_proxy_url(output: &str, prefix: &str, scheme: &str) -> Option<String> {
     let enabled = parse_proxy_key_value(output, &format!("{prefix}Enable"))?;
     if enabled != "1" {
         return None;
@@ -175,6 +175,10 @@ fn build_mac_system_proxy_url(output: &str, prefix: &str) -> Option<String> {
 
     let host = parse_proxy_key_value(output, &format!("{prefix}Proxy"))?;
     let port = parse_proxy_key_value(output, &format!("{prefix}Port"))?;
+    if scheme.eq_ignore_ascii_case("socks5") {
+        return Some(format!("socks5://{host}:{port}"));
+    }
+
     normalize_proxy_url(&format!("{host}:{port}"))
 }
 
@@ -194,8 +198,9 @@ fn read_mac_system_proxy_url() -> Option<String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    build_mac_system_proxy_url(&stdout, "HTTPS")
-        .or_else(|| build_mac_system_proxy_url(&stdout, "HTTP"))
+    build_mac_system_proxy_url(&stdout, "SOCKS", "socks5")
+        .or_else(|| build_mac_system_proxy_url(&stdout, "HTTPS", "http"))
+        .or_else(|| build_mac_system_proxy_url(&stdout, "HTTP", "http"))
 }
 
 #[cfg(target_os = "windows")]
@@ -3626,8 +3631,25 @@ mod tests {
 "#;
 
         assert_eq!(
-            build_mac_system_proxy_url(output, "HTTPS").as_deref(),
+            build_mac_system_proxy_url(output, "HTTPS", "http").as_deref(),
             Some("http://127.0.0.1:7897")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mac_system_proxy_url_prefers_socks_proxy_output() {
+        let output = r#"
+<dictionary> {
+  SOCKSEnable : 1
+  SOCKSPort : 7897
+  SOCKSProxy : 127.0.0.1
+}
+"#;
+
+        assert_eq!(
+            build_mac_system_proxy_url(output, "SOCKS", "socks5").as_deref(),
+            Some("socks5://127.0.0.1:7897")
         );
     }
 
