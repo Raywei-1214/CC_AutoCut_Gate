@@ -138,22 +138,15 @@ fn explicit_proxy_env_url() -> Option<String> {
 }
 
 fn should_use_system_proxy() -> bool {
-    match env::var("LOCAL_UPLOAD_AGENT_GCLOUD_USE_SYSTEM_PROXY") {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on" | "enabled"
-        ),
-        Err(_) => {
-            #[cfg(target_os = "macos")]
-            {
-                true
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                false
-            }
-        }
-    }
+    env::var("LOCAL_UPLOAD_AGENT_GCLOUD_USE_SYSTEM_PROXY")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enabled"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
