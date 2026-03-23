@@ -1216,9 +1216,33 @@ fn build_gcloud_command(spec: &GcloudCommandSpec, args: &[&str]) -> Command {
     ] {
         command.env_remove(variable);
     }
+
+    #[cfg(target_os = "windows")]
+    if spec.program.eq_ignore_ascii_case("cmd.exe")
+        && matches!(spec.prefix_args.first().map(String::as_str), Some("/C"))
+        && spec.prefix_args.len() >= 2
+    {
+        command.args(["/D", "/S", "/C"]);
+        command.arg(build_windows_cmd_command_line(&spec.prefix_args[1], args));
+        return command;
+    }
+
     command.args(&spec.prefix_args);
     command.args(args);
     command
+}
+
+#[cfg(target_os = "windows")]
+fn quote_windows_cmd_argument(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_cmd_command_line(program: &str, args: &[&str]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(quote_windows_cmd_argument(program));
+    parts.extend(args.iter().map(|arg| quote_windows_cmd_argument(arg)));
+    format!("chcp 65001>nul & {}", parts.join(" "))
 }
 
 fn direct_gcloud_command_spec(program: impl Into<String>, display_path: impl Into<String>) -> GcloudCommandSpec {
