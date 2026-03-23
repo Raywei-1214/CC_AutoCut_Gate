@@ -3066,6 +3066,16 @@ fn handle_request(request: Request, state: &AgentHttpState) {
         (Method::Post, "/v1/system/update/install") => {
             handle_install_update(request, state);
         }
+        (Method::Post, "/v1/system/window/show") => {
+            show_main_window(&state.app);
+            respond(
+                request,
+                200,
+                json!({
+                    "success": true,
+                }),
+            );
+        }
         (Method::Post, "/v1/files/pick") => {
             handle_pick_file(request);
         }
@@ -3179,6 +3189,58 @@ fn hide_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
+}
+
+fn local_agent_base_url() -> String {
+    format!("http://{AGENT_HOST}:{AGENT_PORT}")
+}
+
+fn is_address_in_use_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("address already in use")
+        || normalized.contains("only one usage of each socket address")
+        || normalized.contains("os error 10048")
+        || normalized.contains("eaddrinuse")
+}
+
+fn is_running_local_helper_response(payload: &Value) -> bool {
+    let Some(data) = payload.get("data") else {
+        return false;
+    };
+
+    let capabilities = data
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let has_capability = |target: &str| {
+        capabilities
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|value| value == target)
+    };
+
+    payload.get("success").and_then(Value::as_bool) == Some(true)
+        && has_capability("localhost-http")
+        && has_capability("tray-resident")
+}
+
+fn existing_local_helper_running(client: &Client) -> bool {
+    let url = format!("{}/v1/health", local_agent_base_url());
+    client
+        .get(url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .ok()
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.json::<Value>().ok())
+        .is_some_and(|payload| is_running_local_helper_response(&payload))
+}
+
+fn request_existing_local_helper_show_window(client: &Client) {
+    let url = format!("{}/v1/system/window/show", local_agent_base_url());
+    let _ = client.post(url).timeout(Duration::from_secs(2)).send();
 }
 
 fn current_launch_args() -> Vec<String> {
@@ -3321,6 +3383,33 @@ mod tests {
             },
         }
     }
+
+    #[test]
+    fn detects_windows_port_in_use_error() {
+        assert!(is_address_in_use_error(
+            "通常每个套接字地址(协议/网络地址/端口)只允许使用一次。 (os error 10048)"
+        ));
+        assert!(is_address_in_use_error("Address already in use (os error 48)"));
+        assert!(!is_address_in_use_error("permission denied"));
+    }
+
+    #[test]
+    fn recognizes_running_local_helper_health_payload() {
+        let payload = json!({
+            "success": true,
+            "data": {
+                "capabilities": ["localhost-http", "tray-resident", "gcloud-import"]
+            }
+        });
+
+        assert!(is_running_local_helper_response(&payload));
+        assert!(!is_running_local_helper_response(&json!({
+            "success": true,
+            "data": {
+                "capabilities": ["localhost-http"]
+            }
+        })));
+    }
 }
 
 fn main() {
@@ -3415,12 +3504,21 @@ fn main() {
                     pending_update: None,
                     snapshot: default_updater_snapshot(app.package_info().version.to_string()),
                 })),
-                http: client,
+                http: client.clone(),
             });
 
-            if let Err(error) = spawn_local_http_server(state) {
-                let message = if error.contains("Address already in use") {
-                    "检测到已有本地助手正在运行。请先完全退出旧助手，再移动或重新打开新的 App。".to_string()
+            if let Err(error) = spawn_local_http_server(Arc::clone(&state)) {
+                if is_address_in_use_error(&error) && existing_local_helper_running(&client) {
+                    append_startup_log("检测到已有本地助手实例正在运行，复用现有实例");
+                    if should_show_main_window_on_launch() {
+                        request_existing_local_helper_show_window(&client);
+                    }
+                    app.handle().exit(0);
+                    return Ok(());
+                }
+
+                let message = if is_address_in_use_error(&error) {
+                    "检测到端口 17777 已被占用，但当前占用进程不是创剪本地上传助手。请先关闭占用该端口的程序后重试。".to_string()
                 } else {
                     format!("启动本地 HTTP 服务失败：{error}")
                 };
