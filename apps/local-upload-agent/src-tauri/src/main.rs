@@ -1222,8 +1222,8 @@ fn build_gcloud_command(spec: &GcloudCommandSpec, args: &[&str]) -> Command {
         && matches!(spec.prefix_args.first().map(String::as_str), Some("/C"))
         && spec.prefix_args.len() >= 2
     {
-        command.args(["/D", "/S", "/C"]);
-        command.arg(build_windows_cmd_command_line(&spec.prefix_args[1], args));
+        command.args(["/D", "/C"]);
+        command.raw_arg(build_windows_cmd_command_line(&spec.prefix_args[1], args));
         return command;
     }
 
@@ -1232,17 +1232,22 @@ fn build_gcloud_command(spec: &GcloudCommandSpec, args: &[&str]) -> Command {
     command
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn quote_windows_cmd_argument(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn build_windows_cmd_command_line(program: &str, args: &[&str]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(quote_windows_cmd_argument(program));
     parts.extend(args.iter().map(|arg| quote_windows_cmd_argument(arg)));
-    format!("chcp 65001>nul & {}", parts.join(" "))
+    format!("\"{}\"", parts.join(" "))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_gcloud_binary_names() -> [&'static str; 3] {
+    ["gcloud.exe", "gcloud.cmd", "gcloud"]
 }
 
 fn direct_gcloud_command_spec(program: impl Into<String>, display_path: impl Into<String>) -> GcloudCommandSpec {
@@ -1265,14 +1270,14 @@ fn windows_gcloud_install_candidates() -> Vec<PathBuf> {
                     .join("Cloud SDK")
                     .join("google-cloud-sdk")
                     .join("bin")
-                    .join("gcloud.cmd"),
+                    .join("gcloud.exe"),
             );
             candidates.push(
                 base.join("Google")
                     .join("Cloud SDK")
                     .join("google-cloud-sdk")
                     .join("bin")
-                    .join("gcloud.exe"),
+                    .join("gcloud.cmd"),
             );
         }
     }
@@ -1282,7 +1287,7 @@ fn windows_gcloud_install_candidates() -> Vec<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn resolve_gcloud_command() -> Result<GcloudCommandSpec, String> {
-    for candidate in ["gcloud.cmd", "gcloud.exe", "gcloud"] {
+    for candidate in windows_gcloud_binary_names() {
         let mut command = Command::new("where.exe");
         configure_background_command(&mut command);
         let output = command.arg(candidate).output();
@@ -3433,6 +3438,29 @@ mod tests {
                 "capabilities": ["localhost-http"]
             }
         })));
+    }
+
+    #[test]
+    fn build_windows_cmd_command_line_wraps_batch_path_and_args() {
+        let command_line = build_windows_cmd_command_line(
+            r"C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+            &[
+                "storage",
+                "cp",
+                r"C:\视频\[驯龙高手] p01.mp4",
+                "gs://for_cc/demo.mp4",
+            ],
+        );
+
+        assert_eq!(
+            command_line,
+            "\"\"C:\\Program Files (x86)\\Google\\Cloud SDK\\google-cloud-sdk\\bin\\gcloud.cmd\" \"storage\" \"cp\" \"C:\\视频\\[驯龙高手] p01.mp4\" \"gs://for_cc/demo.mp4\"\""
+        );
+    }
+
+    #[test]
+    fn windows_gcloud_binary_names_prefer_exe_before_cmd() {
+        assert_eq!(windows_gcloud_binary_names(), ["gcloud.exe", "gcloud.cmd", "gcloud"]);
     }
 }
 
