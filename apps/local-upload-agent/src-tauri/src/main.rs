@@ -233,6 +233,11 @@ struct AgentUploadTask {
     service_account_json: Option<String>,
 }
 
+struct PreparedGcloudSourcePath {
+    upload_path: String,
+    cleanup_path: Option<PathBuf>,
+}
+
 struct UpdaterRuntimeState {
     pending_update: Option<Update>,
     snapshot: UpdaterSnapshot,
@@ -1643,6 +1648,73 @@ fn build_gcloud_object_name(object_prefix: &str, task_id: &str, filename: &str) 
     )
 }
 
+fn path_requires_gcloud_safe_alias(path: &Path) -> bool {
+    path.to_string_lossy()
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+}
+
+fn build_safe_gcloud_local_filename(original_path: &Path, task_id: &str) -> String {
+    let original_name = original_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("video.mp4");
+    format!("chuangcut-upload-{task_id}-{}", sanitize_filename(original_name))
+}
+
+fn prepare_gcloud_source_path(task: &AgentUploadTask, handle: &TaskHandle) -> Result<PreparedGcloudSourcePath, String> {
+    let original_path = PathBuf::from(&task.local_file_path);
+    if !path_requires_gcloud_safe_alias(&original_path) {
+        return Ok(PreparedGcloudSourcePath {
+            upload_path: task.local_file_path.clone(),
+            cleanup_path: None,
+        });
+    }
+
+    let parent_dir = original_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(env::temp_dir);
+    let alias_path = parent_dir.join(build_safe_gcloud_local_filename(&original_path, &task.task_id));
+
+    if alias_path.exists() {
+        let _ = fs::remove_file(&alias_path);
+    }
+
+    match fs::hard_link(&original_path, &alias_path) {
+        Ok(()) => {
+            append_log(
+                handle,
+                "debug",
+                "检测到本地文件名包含 gcloud wildcard 字符，已创建安全硬链接用于上传",
+                None,
+                Some(alias_path.display().to_string()),
+            );
+        }
+        Err(link_error) => {
+            fs::copy(&original_path, &alias_path)
+                .map_err(|copy_error| {
+                    format!(
+                        "创建 gcloud 安全上传副本失败：hard link={link_error}; copy={copy_error}"
+                    )
+                })?;
+            append_log(
+                handle,
+                "debug",
+                "检测到本地文件名包含 gcloud wildcard 字符，已创建安全副本用于上传",
+                None,
+                Some(alias_path.display().to_string()),
+            );
+        }
+    }
+
+    Ok(PreparedGcloudSourcePath {
+        upload_path: alias_path.to_string_lossy().to_string(),
+        cleanup_path: Some(alias_path),
+    })
+}
+
 fn gcloud_config_dir() -> PathBuf {
     if let Ok(value) = env::var("CLOUDSDK_CONFIG") {
         let trimmed = value.trim();
@@ -2340,6 +2412,7 @@ fn run_gcloud_import_task(
 ) {
     let started_at_system = SystemTime::now();
     let mut auth_context_for_task: Option<GcloudAuthContext> = None;
+    let mut prepared_source_cleanup_path: Option<PathBuf> = None;
 
     let result = (|| -> Result<UploadTaskResult, String> {
         let bucket_name = task
@@ -2403,8 +2476,13 @@ fn run_gcloud_import_task(
             Some(gs_uri.clone()),
         );
 
-        let mut command =
-            build_gcloud_command(&gcloud_spec, &["storage", "cp", &task.local_file_path, &gs_uri]);
+        let prepared_source = prepare_gcloud_source_path(&task, &handle)?;
+        prepared_source_cleanup_path = prepared_source.cleanup_path.clone();
+
+        let mut command = build_gcloud_command(
+            &gcloud_spec,
+            &["storage", "cp", &prepared_source.upload_path, &gs_uri],
+        );
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.envs(build_gcloud_command_envs(auth_context_for_task.as_ref()));
@@ -2570,6 +2648,10 @@ fn run_gcloud_import_task(
                 snapshot.error = Some(error);
             });
         }
+    }
+
+    if let Some(cleanup_path) = prepared_source_cleanup_path {
+        let _ = fs::remove_file(cleanup_path);
     }
 
     revoke_agent_token(&client, &task.base_url, &task.api_token);
@@ -3461,6 +3543,25 @@ mod tests {
     #[test]
     fn windows_gcloud_binary_names_prefer_exe_before_cmd() {
         assert_eq!(windows_gcloud_binary_names(), ["gcloud.exe", "gcloud.cmd", "gcloud"]);
+    }
+
+    #[test]
+    fn path_requires_gcloud_safe_alias_detects_wildcards() {
+        assert!(path_requires_gcloud_safe_alias(Path::new(
+            r"F:\FOR JOB\[驯龙高手]\video[1].mp4"
+        )));
+        assert!(!path_requires_gcloud_safe_alias(Path::new(
+            r"F:\FOR JOB\video-1.mp4"
+        )));
+    }
+
+    #[test]
+    fn build_safe_gcloud_local_filename_sanitizes_original_name() {
+        let filename = build_safe_gcloud_local_filename(
+            Path::new("/tmp/[驯龙高手] 番外合集 p01 [66影视].mp4"),
+            "task-123",
+        );
+        assert_eq!(filename, "chuangcut-upload-task-123-p01-66.mp4");
     }
 }
 
