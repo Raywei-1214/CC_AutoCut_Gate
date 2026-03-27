@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(any(target_os = "windows", test))]
+use encoding_rs::GB18030;
 use mime_guess::MimeGuess;
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -11,7 +13,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -278,6 +280,11 @@ struct CreateTaskBody {
 }
 
 #[derive(Deserialize)]
+struct ScanDirectoryBody {
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct CreateGcloudImportBody {
     #[serde(rename = "baseUrl")]
     base_url: String,
@@ -309,6 +316,13 @@ struct FileSelectionData {
     mime_type: String,
     #[serde(rename = "localFilePath")]
     local_file_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryScanData {
+    normalized_path: String,
+    files: Vec<FileSelectionData>,
 }
 
 #[derive(Deserialize)]
@@ -441,6 +455,178 @@ fn guess_mime_type(path: &Path) -> String {
         .first_raw()
         .unwrap_or("video/mp4")
         .to_string()
+}
+
+fn resolve_home_dir() -> Option<PathBuf> {
+    if let Some(home) = env::var_os("HOME") {
+        return Some(PathBuf::from(home));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(profile) = env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(profile));
+        }
+    }
+
+    None
+}
+
+fn normalize_directory_input_path(input: &str) -> Result<PathBuf, String> {
+    let trimmed = input.trim().trim_matches(|char| char == '"' || char == '\'');
+    if trimmed.is_empty() {
+        return Err("目录路径不能为空".to_string());
+    }
+
+    if trimmed == "~" {
+        return resolve_home_dir().ok_or_else(|| "无法解析当前用户目录".to_string());
+    }
+
+    if trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+        let home = resolve_home_dir().ok_or_else(|| "无法解析当前用户目录".to_string())?;
+        return Ok(home.join(&trimmed[2..]));
+    }
+
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|error| format!("解析目录路径失败：{error}"))
+    }
+}
+
+fn is_supported_video_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm")
+    )
+}
+
+fn handle_scan_directory(mut request: Request) {
+    let body = match read_json_body::<ScanDirectoryBody>(&mut request) {
+        Ok(body) => body,
+        Err(error) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": error
+                }),
+            );
+            return;
+        }
+    };
+
+    let normalized_path = match normalize_directory_input_path(&body.path) {
+        Ok(path) => path,
+        Err(error) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": error
+                }),
+            );
+            return;
+        }
+    };
+
+    let directory_info = match fs::metadata(&normalized_path) {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        Ok(_) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": "目录不存在或不可访问"
+                }),
+            );
+            return;
+        }
+        Err(error) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": format!("读取目录失败：{error}")
+                }),
+            );
+            return;
+        }
+    };
+
+    let _ = directory_info;
+
+    let entries = match fs::read_dir(&normalized_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            respond(
+                request,
+                500,
+                json!({
+                    "success": false,
+                    "error": format!("扫描目录失败：{error}")
+                }),
+            );
+            return;
+        }
+    };
+
+    let mut files: Vec<FileSelectionData> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_supported_video_path(path))
+        .filter_map(|path| {
+            let metadata = fs::metadata(&path).ok()?;
+            Some(FileSelectionData {
+                file_name: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("video.mp4")
+                    .to_string(),
+                file_size: metadata.len(),
+                mime_type: guess_mime_type(&path),
+                local_file_path: path.to_string_lossy().to_string(),
+            })
+        })
+        .collect();
+
+    files.sort_by(|left, right| left.file_name.to_lowercase().cmp(&right.file_name.to_lowercase()));
+
+    if files.is_empty() {
+        respond(
+            request,
+            400,
+            json!({
+                "success": false,
+                "error": "目录内未找到可上传的视频文件"
+            }),
+        );
+        return;
+    }
+
+    let body = DirectoryScanData {
+        normalized_path: normalized_path.to_string_lossy().to_string(),
+        files,
+    };
+
+    respond(
+        request,
+        200,
+        json!({
+            "success": true,
+            "data": body
+        }),
+    );
 }
 
 fn serialize_snapshot(snapshot: &AgentTaskSnapshot) -> serde_json::Value {
@@ -889,12 +1075,64 @@ fn read_child_output<R: Read + Send + 'static>(
     output_tail: Arc<Mutex<Vec<String>>>,
 ) {
     thread::spawn(move || {
-        let buffered = BufReader::new(reader);
-        for line in buffered.lines().map_while(Result::ok) {
+        let mut buffered = BufReader::new(reader);
+        let mut chunk = [0_u8; 4096];
+        let mut current = Vec::<u8>::new();
+
+        let flush_segment = |segment: &[u8]| {
+            let line = decode_command_output_segment(segment);
+            if line.is_empty() {
+                return;
+            }
+
             append_output_tail(&output_tail, &line);
             append_log(&handle, level, line, None, None);
+        };
+
+        loop {
+            match buffered.read(&mut chunk) {
+                Ok(0) => {
+                    flush_segment(&current);
+                    break;
+                }
+                Ok(read_bytes) => {
+                    for byte in &chunk[..read_bytes] {
+                        if *byte == b'\n' || *byte == b'\r' {
+                            flush_segment(&current);
+                            current.clear();
+                            continue;
+                        }
+
+                        current.push(*byte);
+                    }
+                }
+                Err(_) => {
+                    flush_segment(&current);
+                    break;
+                }
+            }
         }
     });
+}
+
+fn decode_command_output_segment(segment: &[u8]) -> String {
+    if segment.is_empty() {
+        return String::new();
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    let raw = match std::str::from_utf8(segment) {
+        Ok(value) => value.to_string(),
+        Err(_) => {
+            let (decoded, _, _) = GB18030.decode(segment);
+            decoded.into_owned()
+        }
+    };
+
+    #[cfg(not(any(target_os = "windows", test)))]
+    let raw = String::from_utf8_lossy(segment).into_owned();
+
+    raw.trim_matches(|ch| ch == '\r' || ch == '\n').trim().to_string()
 }
 
 fn read_gcloud_child_output<R: Read + Send + 'static>(
@@ -911,8 +1149,7 @@ fn read_gcloud_child_output<R: Read + Send + 'static>(
         let mut current = Vec::<u8>::new();
 
         let flush_segment = |segment: &[u8]| {
-            let raw = String::from_utf8_lossy(segment);
-            let line = raw.trim_matches(|ch| ch == '\r' || ch == '\n').trim().to_string();
+            let line = decode_command_output_segment(segment);
             if line.is_empty() {
                 return;
             }
@@ -1639,11 +1876,10 @@ fn sanitize_filename(filename: &str) -> String {
     format!("{}{}", if sanitized.is_empty() { "video" } else { sanitized }, ext)
 }
 
-fn build_gcloud_object_name(object_prefix: &str, task_id: &str, filename: &str) -> String {
+fn build_gcloud_object_name(object_prefix: &str, filename: &str) -> String {
     format!(
-        "{}/{}/{}",
+        "{}/{}",
         object_prefix.trim_end_matches('/'),
-        task_id,
         sanitize_filename(filename)
     )
 }
@@ -2425,7 +2661,7 @@ fn run_gcloud_import_task(
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "GCloud 导入任务缺少 objectPrefix".to_string())?;
-        let object_name = build_gcloud_object_name(object_prefix, &task.task_id, &task.file_name);
+        let object_name = build_gcloud_object_name(object_prefix, &task.file_name);
         let gs_uri = format!("gs://{bucket_name}/{object_name}");
 
         append_log(&handle, "debug", "GCloud 导入任务已创建", None, None);
@@ -3138,9 +3374,10 @@ fn handle_request(request: Request, state: &AgentHttpState) {
                             "health",
                             "desktop-shell",
                             "localhost-http",
-                            "auto-update",
-                            "pick-file",
-                            "upload-task",
+                        "auto-update",
+                        "pick-file",
+                        "scan-directory",
+                        "upload-task",
                         "gcloud-import",
                         "gcloud-cli-orchestrated",
                         "cancel-task",
@@ -3189,6 +3426,9 @@ fn handle_request(request: Request, state: &AgentHttpState) {
         }
         (Method::Post, "/v1/files/pick") => {
             handle_pick_file(request);
+        }
+        (Method::Post, "/v1/files/scan-directory") => {
+            handle_scan_directory(request);
         }
         (Method::Get, "/v1/uploads") => {
             handle_list_tasks(request, state);
@@ -3562,6 +3802,21 @@ mod tests {
             "task-123",
         );
         assert_eq!(filename, "chuangcut-upload-task-123-p01-66.mp4");
+    }
+
+    #[test]
+    fn build_gcloud_object_name_flattens_helper_path() {
+        let object_name = build_gcloud_object_name("raw/shimi/2026-03", "[驯龙高手] p01.mp4");
+        assert_eq!(object_name, "raw/shimi/2026-03/p01.mp4");
+    }
+
+    #[test]
+    fn decode_command_output_segment_falls_back_to_gb18030() {
+        let (encoded, _, _) = GB18030.encode("不是内部或外部命令");
+        assert_eq!(
+            decode_command_output_segment(&encoded),
+            "不是内部或外部命令"
+        );
     }
 }
 
