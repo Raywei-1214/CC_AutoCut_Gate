@@ -285,6 +285,15 @@ struct ScanDirectoryBody {
 }
 
 #[derive(Deserialize)]
+struct RenameFilesBody {
+    #[serde(rename = "folderPath")]
+    folder_path: String,
+    segments: Vec<String>,
+    #[serde(rename = "dryRun", default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize)]
 struct CreateGcloudImportBody {
     #[serde(rename = "baseUrl")]
     base_url: String,
@@ -316,6 +325,35 @@ struct FileSelectionData {
     mime_type: String,
     #[serde(rename = "localFilePath")]
     local_file_path: String,
+}
+
+#[derive(Serialize)]
+struct RenamePreviewItem {
+    order: usize,
+    #[serde(rename = "originalName")]
+    original_name: String,
+    #[serde(rename = "targetName")]
+    target_name: String,
+    changed: bool,
+}
+
+struct RenamePlanItem {
+    order: usize,
+    original_name: String,
+    target_name: String,
+    changed: bool,
+    source_path: PathBuf,
+    target_path: PathBuf,
+}
+
+struct RenamePlanResult {
+    folder_path: String,
+    pattern: String,
+    total_files: usize,
+    changed_files: usize,
+    unchanged_files: usize,
+    items: Vec<RenamePreviewItem>,
+    plan: Vec<RenamePlanItem>,
 }
 
 #[derive(Serialize)]
@@ -502,9 +540,398 @@ fn is_supported_video_path(path: &Path) -> bool {
         path.extension()
             .and_then(|extension| extension.to_str())
             .map(|extension| extension.to_ascii_lowercase())
-            .as_deref(),
+        .as_deref(),
         Some("mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm")
     )
+}
+
+fn is_supported_rename_media_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "mp4"
+                | "mov"
+                | "m4v"
+                | "mkv"
+                | "avi"
+                | "webm"
+                | "jpg"
+                | "jpeg"
+                | "png"
+                | "webp"
+                | "gif"
+                | "bmp"
+                | "tif"
+                | "tiff"
+                | "heic"
+                | "heif"
+                | "avif"
+        )
+    )
+}
+
+fn sanitize_rename_segment(segment: &str) -> String {
+    let mut sanitized = String::with_capacity(segment.len());
+    let mut last_was_dash = false;
+
+    for character in segment.trim().chars() {
+        let mapped = match character {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            _ => character,
+        };
+
+        if mapped.is_whitespace() || mapped == '-' {
+            if !sanitized.is_empty() && !last_was_dash {
+                sanitized.push('-');
+                last_was_dash = true;
+            }
+            continue;
+        }
+
+        sanitized.push(mapped);
+        last_was_dash = false;
+    }
+
+    sanitized.trim_matches('-').to_string()
+}
+
+fn build_rename_pattern(segments: &[String]) -> String {
+    segments
+        .iter()
+        .map(|segment| sanitize_rename_segment(segment))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn compare_numeric_chunks(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_trimmed = left.trim_start_matches('0');
+    let right_trimmed = right.trim_start_matches('0');
+    let left_normalized = if left_trimmed.is_empty() { "0" } else { left_trimmed };
+    let right_normalized = if right_trimmed.is_empty() { "0" } else { right_trimmed };
+
+    left_normalized
+        .len()
+        .cmp(&right_normalized.len())
+        .then_with(|| left_normalized.cmp(right_normalized))
+        .then_with(|| left.len().cmp(&right.len()))
+}
+
+fn natural_compare(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+
+    while left_index < left_chars.len() && right_index < right_chars.len() {
+        let left_is_digit = left_chars[left_index].is_ascii_digit();
+        let right_is_digit = right_chars[right_index].is_ascii_digit();
+
+        if left_is_digit && right_is_digit {
+            let left_start = left_index;
+            let right_start = right_index;
+
+            while left_index < left_chars.len() && left_chars[left_index].is_ascii_digit() {
+                left_index += 1;
+            }
+            while right_index < right_chars.len() && right_chars[right_index].is_ascii_digit() {
+                right_index += 1;
+            }
+
+            let left_chunk: String = left_chars[left_start..left_index].iter().collect();
+            let right_chunk: String = right_chars[right_start..right_index].iter().collect();
+            let ordering = compare_numeric_chunks(&left_chunk, &right_chunk);
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+            continue;
+        }
+
+        let left_start = left_index;
+        let right_start = right_index;
+
+        while left_index < left_chars.len() && !left_chars[left_index].is_ascii_digit() {
+            left_index += 1;
+        }
+        while right_index < right_chars.len() && !right_chars[right_index].is_ascii_digit() {
+            right_index += 1;
+        }
+
+        let left_chunk = left_chars[left_start..left_index]
+            .iter()
+            .collect::<String>()
+            .to_lowercase();
+        let right_chunk = right_chars[right_start..right_index]
+            .iter()
+            .collect::<String>()
+            .to_lowercase();
+        let ordering = left_chunk.cmp(&right_chunk);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    left_chars.len().cmp(&right_chars.len()).then_with(|| left.cmp(right))
+}
+
+fn build_rename_plan(folder_path: &Path, segments: &[String]) -> Result<RenamePlanResult, String> {
+    let mut file_names: Vec<String> = Vec::new();
+    let read_dir = fs::read_dir(folder_path).map_err(|error| format!("读取目录失败：{error}"))?;
+
+    for entry in read_dir {
+        let entry = entry.map_err(|error| format!("读取目录项失败：{error}"))?;
+        let path = entry.path();
+        if path.is_file() && is_supported_rename_media_path(&path) {
+            file_names.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+
+    file_names.sort_by(|left, right| natural_compare(left, right));
+
+    let pattern = build_rename_pattern(segments);
+    let pad_width = std::cmp::max(3, file_names.len().to_string().len());
+    let mut plan: Vec<RenamePlanItem> = Vec::with_capacity(file_names.len());
+    let mut target_paths: HashMap<String, String> = HashMap::new();
+
+    for (index, original_name) in file_names.iter().enumerate() {
+        let extension = Path::new(original_name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| format!(".{value}"))
+            .unwrap_or_default();
+        let sequence = format!("{:0width$}", index + 1, width = pad_width);
+        let base_name = if pattern.is_empty() {
+            sequence
+        } else {
+            format!("{pattern}-{sequence}")
+        };
+        let target_name = format!("{base_name}{extension}");
+        let target_path_string = folder_path.join(&target_name).to_string_lossy().to_string();
+
+        if let Some(existing) = target_paths.get(&target_path_string) {
+            return Err(format!("目标文件名冲突：{existing} 与 {original_name}"));
+        }
+        target_paths.insert(target_path_string, original_name.clone());
+
+        plan.push(RenamePlanItem {
+            order: index + 1,
+            original_name: original_name.clone(),
+            target_name: target_name.clone(),
+            changed: *original_name != target_name,
+            source_path: folder_path.join(original_name),
+            target_path: folder_path.join(target_name),
+        });
+    }
+
+    let changed_files = plan.iter().filter(|item| item.changed).count();
+    let items = plan
+        .iter()
+        .map(|item| RenamePreviewItem {
+            order: item.order,
+            original_name: item.original_name.clone(),
+            target_name: item.target_name.clone(),
+            changed: item.changed,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(RenamePlanResult {
+        folder_path: folder_path.to_string_lossy().to_string(),
+        pattern,
+        total_files: plan.len(),
+        changed_files,
+        unchanged_files: plan.len().saturating_sub(changed_files),
+        items,
+        plan,
+    })
+}
+
+fn handle_rename_files(mut request: Request) {
+    let body = match read_json_body::<RenameFilesBody>(&mut request) {
+        Ok(body) => body,
+        Err(error) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": error
+                }),
+            );
+            return;
+        }
+    };
+
+    let folder_path = match normalize_directory_input_path(&body.folder_path) {
+        Ok(path) => path,
+        Err(error) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": error
+                }),
+            );
+            return;
+        }
+    };
+
+    match fs::metadata(&folder_path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": "输入路径不是文件夹，请重新填写"
+                }),
+            );
+            return;
+        }
+        Err(error) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": format!("读取目录失败：{error}")
+                }),
+            );
+            return;
+        }
+    }
+
+    if body.segments.len() != 4 {
+        respond(
+            request,
+            400,
+            json!({
+                "success": false,
+                "error": "必须提供 4 个命名片段槽位"
+            }),
+        );
+        return;
+    }
+
+    let rename_plan = match build_rename_plan(&folder_path, &body.segments) {
+        Ok(result) => result,
+        Err(error) => {
+            respond(
+                request,
+                400,
+                json!({
+                    "success": false,
+                    "error": error
+                }),
+            );
+            return;
+        }
+    };
+
+    if !body.dry_run {
+        #[derive(Clone, Copy)]
+        enum RenameState {
+            Original,
+            Temp,
+            Final,
+        }
+
+        struct RenameStage {
+            source_path: PathBuf,
+            target_path: PathBuf,
+            temp_path: PathBuf,
+            state: RenameState,
+        }
+
+        let mut stages = rename_plan
+            .plan
+            .iter()
+            .filter(|item| item.changed)
+            .enumerate()
+            .map(|(index, item)| {
+                let extension = item
+                    .source_path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| format!(".{value}"))
+                    .unwrap_or_default();
+                let temp_path = folder_path.join(format!(
+                    ".cc-rename-temp-{}-{index}{}",
+                    Uuid::new_v4(),
+                    extension
+                ));
+
+                RenameStage {
+                    source_path: item.source_path.clone(),
+                    target_path: item.target_path.clone(),
+                    temp_path,
+                    state: RenameState::Original,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let rename_result: Result<(), String> = (|| {
+            for stage in stages.iter_mut() {
+                fs::rename(&stage.source_path, &stage.temp_path)
+                    .map_err(|error| format!("临时重命名失败：{error}"))?;
+                stage.state = RenameState::Temp;
+            }
+
+            for stage in stages.iter_mut() {
+                fs::rename(&stage.temp_path, &stage.target_path)
+                    .map_err(|error| format!("目标重命名失败：{error}"))?;
+                stage.state = RenameState::Final;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = rename_result {
+            for stage in stages.iter_mut().rev() {
+                match stage.state {
+                    RenameState::Final => {
+                        let _ = fs::rename(&stage.target_path, &stage.source_path);
+                    }
+                    RenameState::Temp => {
+                        let _ = fs::rename(&stage.temp_path, &stage.source_path);
+                    }
+                    RenameState::Original => {}
+                }
+                stage.state = RenameState::Original;
+            }
+
+            respond(
+                request,
+                500,
+                json!({
+                    "success": false,
+                    "error": error
+                }),
+            );
+            return;
+        }
+    }
+
+    respond(
+        request,
+        200,
+        json!({
+            "success": true,
+            "data": {
+                "folderPath": rename_plan.folder_path,
+                "pattern": rename_plan.pattern,
+                "totalFiles": rename_plan.total_files,
+                "changedFiles": rename_plan.changed_files,
+                "unchangedFiles": rename_plan.unchanged_files,
+                "dryRun": body.dry_run,
+                "items": rename_plan.items,
+            }
+        }),
+    );
 }
 
 fn handle_scan_directory(mut request: Request) {
@@ -3377,6 +3804,7 @@ fn handle_request(request: Request, state: &AgentHttpState) {
                         "auto-update",
                         "pick-file",
                         "scan-directory",
+                        "rename-files",
                         "upload-task",
                         "gcloud-import",
                         "gcloud-cli-orchestrated",
@@ -3429,6 +3857,9 @@ fn handle_request(request: Request, state: &AgentHttpState) {
         }
         (Method::Post, "/v1/files/scan-directory") => {
             handle_scan_directory(request);
+        }
+        (Method::Post, "/v1/files/rename") => {
+            handle_rename_files(request);
         }
         (Method::Get, "/v1/uploads") => {
             handle_list_tasks(request, state);
